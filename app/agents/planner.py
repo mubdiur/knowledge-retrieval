@@ -1,29 +1,26 @@
-"""Query planner — generates and executes dynamic multi-hop execution plans.
+"""Query planner — generates and executes iterative multi-hop execution plans.
 
 This is the core difference between naive RAG and a real agentic system.
 
-Instead of:
-    classify → call tools → merge → answer
+Instead of static decomposition, it runs a loop:
 
-It does:
-    plan (generate step-wise execution graph)
-    → for each step: call tool → inspect output → inject into next input
-    → replan if gaps found
-    → synthesize final answer
+    plan → execute → OBSERVE → refine → repeat → early-stop
 
-Each step's input can depend on the output of previous steps,
-enabling true multi-hop: "Find incidents → extract service names →
-look up owners → search docs about those owners' past incidents."
+Each tool call's output is inspected. If the result contains entities that
+could unlock more information, a refinement step is dynamically created.
+The loop stops when confidence is high or max iterations reached.
 """
 
 import logging
-from collections import defaultdict
+import re
 from typing import Any, Callable
 
 from app.tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+
+# ── Data Classes ──────────────────────────────────────────────────────────────
 
 class ExecutionStep:
     """A single step in an execution plan."""
@@ -33,6 +30,7 @@ class ExecutionStep:
         step_id: int,
         tool: str,
         description: str,
+        rationale: str = "",
         params_builder: Callable[[dict[int, Any]], dict[str, Any]] | None = None,
         params: dict[str, Any] | None = None,
         depends_on: list[int] | None = None,
@@ -42,18 +40,41 @@ class ExecutionStep:
         self.step_id = step_id
         self.tool = tool
         self.description = description
-        # params_builder receives all prior results and returns params dict
+        self.rationale = rationale  # WHY this step exists — logged in trace
         self.params_builder = params_builder
         self.params = params or {}
         self.depends_on = depends_on or []
         self.result_key = result_key or f"step_{step_id}"
-        # Optional: only run this step if condition(prior_results) is True
         self.condition = condition
 
     def build_params(self, prior_results: dict[int, Any]) -> dict[str, Any]:
         if self.params_builder:
             return {**self.params, **self.params_builder(prior_results)}
         return dict(self.params)
+
+
+class Observation:
+    """What the planner observes after executing a step."""
+
+    def __init__(
+        self,
+        step_id: int,
+        tool: str,
+        success: bool,
+        result_count: int,
+        extracted_entities: list[str],
+        has_data: bool,
+        confidence: float,
+        gap: str | None = None,
+    ):
+        self.step_id = step_id
+        self.tool = tool
+        self.success = success
+        self.result_count = result_count
+        self.extracted_entities = extracted_entities
+        self.has_data = has_data
+        self.confidence = confidence  # 0.0 - 1.0
+        self.gap = gap  # Description of what's missing, if anything
 
 
 class ExecutionPlan:
@@ -87,6 +108,9 @@ class ExecutionPlan:
             visit(step)
         return ordered
 
+    def append(self, step: ExecutionStep) -> None:
+        self.steps.append(step)
+
     def __repr__(self) -> str:
         lines = ["ExecutionPlan:"]
         for s in self.topological_order():
@@ -95,12 +119,20 @@ class ExecutionPlan:
         return "\n".join(lines)
 
 
-class QueryPlanner:
-    """Generates execution plans for queries based on type and content.
+# ── Planner ───────────────────────────────────────────────────────────────────
 
-    Rule-based by default, with an extension point for LLM-based planning.
-    The planner inspects the query, classifies it, then produces a DAG of steps
-    where each step can depend on prior step outputs.
+class QueryPlanner:
+    """Generates and iteratively executes multi-hop plans.
+
+    The planner is callable externally but also powers the iterative loop:
+        plan() → execute_step() → observe() → refine() → execute_step() → ...
+
+    Key design:
+        - Each step can inject prior results into its params
+        - After each step, observe() checks data quality and extracts entities
+        - If confidence is low, refine() generates the next step dynamically
+        - The loop stops when confidence >= threshold or max iterations reached
+        - Early stopping prevents wasted tool calls when we have enough
     """
 
     def __init__(self):
@@ -110,6 +142,430 @@ class QueryPlanner:
         """Register an external planner (e.g. LLM-based) that can override planning."""
         self._plan_hooks.append(hook)
 
+    # ── Iterative Loop ───────────────────────────────────────────────────────
+
+    async def execute_iterative(
+        self,
+        query: str,
+        query_type: str,
+        base_filters: dict[str, Any] | None = None,
+        base_time_range: tuple | None = None,
+        max_iterations: int = 5,
+        confidence_threshold: float = 0.7,
+        trace_log: list[dict] | None = None,
+    ) -> dict[int, Any]:
+        """Run the iterative plan → execute → observe → refine loop.
+
+        Args:
+            query: Original user query.
+            query_type: Classified query type.
+            base_filters: Optional global filters.
+            base_time_range: Optional global time range.
+            max_iterations: Maximum steps before forced stop.
+            confidence_threshold: Stop when overall confidence >= this.
+            trace_log: Optional list to append trace dicts to (for reasoning trace).
+
+        Returns:
+            dict[step_id, tool_result] for all executed steps.
+        """
+        _trace = trace_log if trace_log is not None else []
+
+        # ── Phase 1: Generate initial plan ───────────────────────────────
+        _trace.append({
+            "step": len(_trace) + 1,
+            "action": "plan",
+            "tool": None,
+            "input_summary": f"Query type={query_type}, filters={base_filters}",
+            "output_summary": "Generating initial execution plan",
+        })
+
+        initial_plan = self.plan(query, query_type, base_filters, base_time_range)
+        steps_executed: dict[int, Any] = {}
+        step_counter = 0
+        entities_found: list[str] = []
+
+        # ── Phase 2: Iterative execution loop ────────────────────────────
+        for step in initial_plan.topological_order():
+            if step_counter >= max_iterations:
+                break
+            step_counter += 1
+
+            result = await self._execute_single(
+                step, steps_executed, base_filters, base_time_range, _trace,
+            )
+            if result is None:
+                continue
+
+            # Observe
+            observation = self._observe(step, result, entities_found, query)
+            _trace.append({
+                "step": len(_trace) + 1,
+                "action": "observe",
+                "tool": step.tool,
+                "input_summary": f"Inspecting {observation.result_count} results from step {step.step_id}",
+                "output_summary": (
+                    f"confidence={observation.confidence:.2f}, "
+                    f"entities={observation.extracted_entities}, "
+                    f"gap={observation.gap or 'none'}"
+                ),
+            })
+
+            entities_found.extend(observation.extracted_entities)
+
+            # Refinement loop: keep refining until confidence high or maxed
+            while (
+                observation.confidence < confidence_threshold
+                and observation.gap is not None
+                and step_counter < max_iterations
+            ):
+                step_counter += 1
+                refine_step = self._generate_refinement(
+                    step_counter, observation, entities_found, query,
+                )
+                if refine_step is None:
+                    break
+
+                _trace.append({
+                    "step": len(_trace) + 1,
+                    "action": "refine",
+                    "tool": refine_step.tool,
+                    "input_summary": refine_step.rationale,
+                    "output_summary": f"Generated refinement step using {refine_step.tool}",
+                })
+
+                result = await self._execute_single(
+                    refine_step, steps_executed, base_filters, base_time_range, _trace,
+                )
+                if result is None:
+                    break
+
+                observation = self._observe(refine_step, result, entities_found, query)
+                _trace.append({
+                    "step": len(_trace) + 1,
+                    "action": "observe",
+                    "tool": refine_step.tool,
+                    "input_summary": f"Refinement step {refine_step.step_id} produced {observation.result_count} results",
+                    "output_summary": (
+                        f"confidence={observation.confidence:.2f}, "
+                        f"gap={observation.gap or 'none'}"
+                    ),
+                })
+                entities_found.extend(observation.extracted_entities)
+
+        # ── Phase 3: Final assessment ────────────────────────────────────
+        overall_confidence = self._assess_confidence(steps_executed)
+        _trace.append({
+            "step": len(_trace) + 1,
+            "action": "assess",
+            "tool": None,
+            "input_summary": f"After {len(steps_executed)} steps",
+            "output_summary": f"Overall confidence={overall_confidence:.2f}, "
+                              f"entities={list(set(entities_found))}, "
+                              f"stopped={'threshold met' if overall_confidence >= confidence_threshold else 'max iterations' if step_counter >= max_iterations else 'plan complete'}",
+        })
+
+        return steps_executed
+
+    # ── Single Step Execution ─────────────────────────────────────────────
+
+    async def _execute_single(
+        self,
+        step: ExecutionStep,
+        results_so_far: dict[int, Any],
+        base_filters: dict[str, Any] | None,
+        base_time_range: tuple | None,
+        trace_log: list[dict],
+    ) -> dict[str, Any] | None:
+        """Execute one step, log to trace, return result."""
+        # Check condition
+        if step.condition and not step.condition(results_so_far):
+            logger.info("  Step %d skipped (condition not met)", step.step_id)
+            trace_log.append({
+                "step": len(trace_log) + 1,
+                "action": "skip",
+                "tool": step.tool,
+                "input_summary": step.rationale or step.description,
+                "output_summary": "Condition not met — skipped",
+            })
+            results_so_far[step.step_id] = {"success": True, "data": [], "skipped": True}
+            return None
+
+        # Get tool
+        tool = ToolRegistry.get(step.tool)
+        if not tool:
+            logger.warning("  Tool '%s' not found", step.tool)
+            results_so_far[step.step_id] = {"success": False, "data": [], "error": f"Tool '{step.tool}' not found"}
+            return None
+
+        # Build params from prior results
+        params = step.build_params(results_so_far)
+        if base_filters and "filters" not in params:
+            params.setdefault("filters", base_filters)
+        if base_time_range and "time_range" not in params:
+            params.setdefault("time_range", base_time_range)
+
+        # Execute
+        logger.info("  Step %d: %s → %s", step.step_id, step.tool, step.description)
+        try:
+            result = await tool.run(**params)
+            results_so_far[step.step_id] = result
+            count = result.get("result_count", len(result.get("data", [])))
+            trace_log.append({
+                "step": len(trace_log) + 1,
+                "action": "execute",
+                "tool": step.tool,
+                "input_summary": step.rationale or step.description,
+                "output_summary": f"Got {count} results (success={result.get('success')})",
+            })
+            return result
+        except Exception as e:
+            logger.exception("  Step %d failed", step.step_id)
+            results_so_far[step.step_id] = {"success": False, "data": [], "error": str(e)}
+            trace_log.append({
+                "step": len(trace_log) + 1,
+                "action": "execute",
+                "tool": step.tool,
+                "input_summary": step.rationale or step.description,
+                "output_summary": f"Failed: {str(e)[:200]}",
+            })
+            return None
+
+    # ── Observation ───────────────────────────────────────────────────────
+
+    def _observe(
+        self,
+        step: ExecutionStep,
+        result: dict[str, Any],
+        existing_entities: list[str],
+        original_query: str,
+    ) -> Observation:
+        """Inspect tool output: extract entities, assess confidence, detect gaps."""
+        if not result.get("success"):
+            return Observation(
+                step_id=step.step_id,
+                tool=step.tool,
+                success=False,
+                result_count=0,
+                extracted_entities=[],
+                has_data=False,
+                confidence=0.0,
+                gap="Tool call failed",
+            )
+
+        data = result.get("data", [])
+        count = result.get("result_count", len(data))
+        has_data = count > 0
+
+        # Extract entities from this result
+        entities = self._extract_entities_from_result(result)
+
+        # Confidence scoring
+        confidence = self._score_confidence(step, result, count)
+
+        # Gap detection
+        gap = self._detect_gap(step, result, count, existing_entities, original_query)
+
+        return Observation(
+            step_id=step.step_id,
+            tool=step.tool,
+            success=True,
+            result_count=count,
+            extracted_entities=entities,
+            has_data=has_data,
+            confidence=confidence,
+            gap=gap,
+        )
+
+    def _score_confidence(self, step: ExecutionStep, result: dict[str, Any], count: int) -> float:
+        """Score confidence in this result on 0.0-1.0.
+
+        Factors:
+            - Has data at all
+            - Number of results (more = higher confidence, up to a point)
+            - Source reliability (SQL > vector > keyword > entity lookup)
+        """
+        if not result.get("success"):
+            return 0.0
+
+        if count == 0:
+            return 0.1  # Empty but successful
+
+        # Base from count (saturating at 10)
+        count_score = min(count / 10.0, 1.0)
+
+        # Source reliability multiplier
+        source = result.get("source", "")
+        if source == "postgresql":
+            source_bonus = 0.2
+        elif source in ("incidents_db",):
+            source_bonus = 0.15
+        elif source in ("vector_store", "vector_store_logs"):
+            source_bonus = 0.1
+        elif source == "bm25":
+            source_bonus = 0.05
+        elif source == "entity_db":
+            source_bonus = 0.0  # Entity lookup is supporting data
+        else:
+            source_bonus = 0.0
+
+        return min(count_score + source_bonus, 1.0)
+
+    def _detect_gap(
+        self,
+        step: ExecutionStep,
+        result: dict[str, Any],
+        count: int,
+        existing_entities: list[str],
+        original_query: str,
+    ) -> str | None:
+        """Detect what information is still missing.
+
+        Returns a description of the gap, or None if no gap.
+        """
+        if count == 0:
+            return "No results found"
+
+        data = result.get("data", [])
+
+        # If we got incidents but no root cause, that's a gap
+        if result.get("source") == "incidents_db":
+            has_root_causes = any(
+                inc.get("root_cause") for inc in (data if isinstance(data, list) else [])
+            )
+            if not has_root_causes:
+                return "Incidents found but root cause information missing"
+
+        # If we got doc results but entities are sparse
+        if result.get("source") in ("vector_store", "bm25") and count > 0:
+            if not existing_entities:
+                return "Need to identify entities (services, teams) mentioned in these results"
+
+        # If original query asks for ownership and we haven't found it
+        if any(w in original_query.lower() for w in ("who owns", "owner", "responsible")):
+            if not any(e for e in existing_entities if e in str(data).lower()):
+                return "Need to identify owner/team for entity"
+
+        return None
+
+    @staticmethod
+    def _extract_entities_from_result(result: dict[str, Any]) -> list[str]:
+        """Extract entity names from a tool result."""
+        entities = []
+        data = result.get("data", [])
+
+        if isinstance(data, list):
+            for item in data:
+                # Check various entity fields
+                for key in ("name", "service", "team", "hostname", "service_name", "title"):
+                    val = item.get(key)
+                    if val and isinstance(val, str) and len(val) > 1:
+                        entities.append(val)
+        elif isinstance(data, dict):
+            for category, items in data.items():
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict):
+                            for key in ("name", "hostname", "service"):
+                                val = item.get(key)
+                                if val and isinstance(val, str):
+                                    entities.append(val)
+
+        return list(set(entities))
+
+    # ── Refinement Generation ─────────────────────────────────────────────
+
+    def _generate_refinement(
+        self,
+        step_id: int,
+        observation: Observation,
+        entities_found: list[str],
+        original_query: str,
+    ) -> ExecutionStep | None:
+        """Dynamically generate a refinement step based on observation.
+
+        This is where the iterative loop gets its power:
+        - If we found entities but no docs about them → search_vector
+        - If we found incidents but no root cause → search_keyword for terms
+        - If we found docs but no owner → entity_lookup
+        """
+        gap = observation.gap
+        if gap is None:
+            return None
+
+        # Gap: incidents without root cause → search for related docs
+        if "root cause" in (gap or "").lower():
+            def build_rc_search(ents):
+                def _build(prior):
+                    query_str = original_query
+                    if ents:
+                        query_str = f"{' '.join(ents[-3:])} root cause"
+                    return {"query": query_str, "top_k": 10}
+                return _build
+
+            return ExecutionStep(
+                step_id=step_id,
+                tool="search_vector",
+                description="Search for root cause documentation",
+                rationale=f"Incidents found but missing root cause. Searching docs with entities: {entities_found[-3:] if entities_found else original_query}",
+                params_builder=build_rc_search(entities_found),
+                result_key=f"refine_{step_id}",
+            )
+
+        # Gap: need entity identification → entity lookup
+        if "entities" in (gap or "").lower() or "identify" in (gap or "").lower():
+            # Extract a candidate name from the query
+            name = self._extract_entity_name(original_query)
+
+            return ExecutionStep(
+                step_id=step_id,
+                tool="entity_lookup",
+                description=f"Look up entity: {name}",
+                rationale=f"Results mention unknown entities. Looking up '{name}' to identify service/team context",
+                params={"name": name},
+                result_key=f"refine_{step_id}",
+            )
+
+        # Gap: need owner → entity lookup
+        if "owner" in (gap or "").lower():
+            name = self._extract_entity_name(original_query)
+            return ExecutionStep(
+                step_id=step_id,
+                tool="entity_lookup",
+                description=f"Find owner for: {name}",
+                rationale=f"Query asks about ownership. Looking up '{name}' to find responsible team/person",
+                params={"name": name},
+                result_key=f"refine_{step_id}",
+            )
+
+        # Generic: search_keyword for the gap terms
+        return ExecutionStep(
+            step_id=step_id,
+            tool="search_keyword",
+            description=f"Keyword search: {gap[:80]}",
+            rationale=f"Gap detected: '{gap}'. Using keyword search for precision.",
+            params={"query": gap, "top_k": 10},
+            result_key=f"refine_{step_id}",
+        )
+
+    # ── Final Confidence Assessment ───────────────────────────────────────
+
+    def _assess_confidence(self, results: dict[int, Any]) -> float:
+        """Overall confidence across all executed steps (0.0-1.0)."""
+        if not results:
+            return 0.0
+
+        scores = []
+        for step_id, result in results.items():
+            if isinstance(step_id, int) and result.get("success"):
+                count = result.get("result_count", len(result.get("data", [])))
+                score = min(count / 5.0, 1.0) if count > 0 else 0.1
+                scores.append(score)
+
+        if not scores:
+            return 0.0
+
+        return sum(scores) / len(scores)
+
     # ── Plan Generation ──────────────────────────────────────────────────────
 
     def plan(
@@ -118,12 +574,13 @@ class QueryPlanner:
         query_type: str,
         filters: dict[str, Any] | None = None,
         time_range: tuple | None = None,
-    ) -> ExecutionPlan:
+    ) -> "ExecutionPlan":
         """Generate an execution plan for the given query.
 
         Tries external hooks first, falls back to built-in rules.
         """
-        # Try external planners first
+        
+
         for hook in self._plan_hooks:
             try:
                 plan = hook(query, query_type, filters, time_range)
@@ -133,260 +590,222 @@ class QueryPlanner:
             except Exception as e:
                 logger.warning("External planner hook failed: %s", e)
 
-        # Built-in planning
         plan_fn = getattr(self, f"_plan_{query_type}", self._plan_exploratory)
         return plan_fn(query, filters, time_range)
 
     # ── Built-in Plans ───────────────────────────────────────────────────────
 
-    def _plan_factual(self, query: str, filters: dict | None, time_range: tuple | None) -> ExecutionPlan:
-        """Single-step: entity lookup."""
-        # Extract potential entity name from query
+    def _plan_factual(self, query: str, filters: dict | None, time_range: tuple | None):
+        
         name = self._extract_entity_name(query)
         return ExecutionPlan([
             ExecutionStep(
-                step_id=1,
-                tool="entity_lookup",
+                step_id=1, tool="entity_lookup",
                 description=f"Look up entity '{name}'",
+                rationale=f"Query asks about '{name}'. Direct entity lookup is the fastest path.",
                 params={"name": name, "entity_type": None},
                 result_key="entities",
             ),
         ])
 
-    def _plan_relational(self, query: str, filters: dict | None, time_range: tuple | None) -> ExecutionPlan:
-        """Multi-step: find entity → query related data."""
+    def _plan_relational(self, query: str, filters: dict | None, time_range: tuple | None):
+        
         name = self._extract_entity_name(query)
         steps = [
             ExecutionStep(
-                step_id=1,
-                tool="entity_lookup",
+                step_id=1, tool="entity_lookup",
                 description=f"Find '{name}' to identify type",
+                rationale="Need to know if this is a service, team, or user before querying relationships.",
                 params={"name": name},
                 result_key="entity_info",
             ),
         ]
 
-        # Step 2 depends on step 1 — use the result to choose query
-        def build_sql(params_builder):
-            def _build(prior):
-                entity = prior.get(1, {}).get("data", {})
-                # If we found a service, query its team/owner
-                services = entity.get("services", [])
-                if services:
-                    svc_name = services[0].get("name", "")
-                    return {"query": f"""
-                        SELECT s.name, s.environment, u.name as owner, t.name as team
-                        FROM services s
-                        LEFT JOIN users u ON s.owner_id = u.id
-                        LEFT JOIN teams t ON s.team_id = t.id
-                        WHERE s.name ILIKE '%{svc_name}%'
-                    """}
-                # If we found a team, query its services
-                teams = entity.get("teams", [])
-                if teams:
-                    team_name = teams[0].get("name", "")
-                    return {"query": f"""
-                        SELECT s.name, s.environment, u.name as owner
-                        FROM services s
-                        JOIN teams t ON s.team_id = t.id
-                        JOIN users u ON s.owner_id = u.id
-                        WHERE t.name ILIKE '%{team_name}%'
-                    """}
-                return {"query": "SELECT name, environment FROM services LIMIT 10"}
-            return _build
+        def build_sql(prior):
+            entity = prior.get(1, {}).get("data", {})
+            services = entity.get("services", [])
+            if services:
+                svc_name = services[0].get("name", "")
+                return {"query": f"""
+                    SELECT s.name, s.environment, u.name as owner, t.name as team
+                    FROM services s
+                    LEFT JOIN users u ON s.owner_id = u.id
+                    LEFT JOIN teams t ON s.team_id = t.id
+                    WHERE s.name ILIKE '%{svc_name}%'
+                """}
+            teams = entity.get("teams", [])
+            if teams:
+                team_name = teams[0].get("name", "")
+                return {"query": f"""
+                    SELECT s.name, s.environment, u.name as owner
+                    FROM services s
+                    JOIN teams t ON s.team_id = t.id
+                    JOIN users u ON s.owner_id = u.id
+                    WHERE t.name ILIKE '%{team_name}%'
+                """}
+            return {"query": "SELECT name, environment FROM services LIMIT 10"}
 
         steps.append(
             ExecutionStep(
-                step_id=2,
-                tool="query_sql",
+                step_id=2, tool="query_sql",
                 description="Query relational data based on entity found",
-                params_builder=build_sql(None),
+                rationale="Entity identified. Now querying the database for relationships.",
+                params_builder=build_sql,
                 depends_on=[1],
                 result_key="relationships",
             )
         )
         return ExecutionPlan(steps)
 
-    def _plan_time_based(self, query: str, filters: dict | None, time_range: tuple | None) -> ExecutionPlan:
-        """Two-step: get incidents → entity enrichment for each."""
+    def _plan_time_based(self, query: str, filters: dict | None, time_range: tuple | None):
+        
         steps = [
             ExecutionStep(
-                step_id=1,
-                tool="get_incidents",
+                step_id=1, tool="get_incidents",
                 description="Fetch incidents in time range",
+                rationale="Time-based query. First get all incidents in the window.",
                 params={"time_range": time_range, "limit": 20},
                 result_key="incidents",
             ),
         ]
 
-        def build_enrich(params_builder):
-            def _build(prior):
-                incidents = prior.get(1, {}).get("data", [])
-                # Extract a service name from the first incident
-                if incidents:
-                    svc = incidents[0].get("service")
-                    if svc:
-                        return {"name": svc, "entity_type": "service"}
-                return {"name": "", "entity_type": None}
-            return _build
+        def build_enrich(prior):
+            incidents = prior.get(1, {}).get("data", [])
+            if incidents:
+                svc = incidents[0].get("service")
+                if svc:
+                    return {"name": svc, "entity_type": "service"}
+            return {"name": "", "entity_type": None}
 
         steps.append(
             ExecutionStep(
-                step_id=2,
-                tool="entity_lookup",
+                step_id=2, tool="entity_lookup",
                 description="Enrich with entity details about the service",
-                params_builder=build_enrich(None),
+                rationale="Incidents found. Enriching with service ownership for context.",
+                params_builder=build_enrich,
                 depends_on=[1],
                 result_key="entity_enrichment",
-                # Only run if we have incidents
                 condition=lambda prior: bool(prior.get(1, {}).get("data")),
             )
         )
         return ExecutionPlan(steps)
 
-    def _plan_causal(self, query: str, filters: dict | None, time_range: tuple | None) -> ExecutionPlan:
-        """Three-step: find incidents → search docs about root cause → entity lookup."""
+    def _plan_causal(self, query: str, filters: dict | None, time_range: tuple | None):
+        
         svc_name = self._extract_entity_name(query)
-
         steps = [
             ExecutionStep(
-                step_id=1,
-                tool="get_incidents",
+                step_id=1, tool="get_incidents",
                 description="Find incidents related to the query",
+                rationale="Causal analysis starts with finding the incidents.",
                 params={"service": svc_name if svc_name else None, "limit": 10},
                 result_key="incidents",
             ),
         ]
 
-        def build_doc_search(params_builder):
-            def _build(prior):
-                incidents = prior.get(1, {}).get("data", [])
-                title = ""
-                if incidents:
-                    title = incidents[0].get("title", "")
-                return {
-                    "query": f"{query} {title}",
-                    "filters": filters,
-                    "time_range": time_range,
-                    "top_k": 15,
-                }
-            return _build
+        def build_doc_search(prior):
+            incidents = prior.get(1, {}).get("data", [])
+            title = incidents[0].get("title", "") if incidents else ""
+            return {"query": f"{query} {title}", "filters": filters, "time_range": time_range, "top_k": 15}
 
         steps.append(
             ExecutionStep(
-                step_id=2,
-                tool="search_vector",
+                step_id=2, tool="search_vector",
                 description="Search documentation about the incident",
-                params_builder=build_doc_search(None),
+                rationale="Incidents identified. Searching docs for root cause and context.",
+                params_builder=build_doc_search,
                 depends_on=[1],
                 result_key="docs",
             )
         )
 
-        def build_entity_lookup(params_builder):
-            def _build(prior):
-                incidents = prior.get(1, {}).get("data", [])
-                if incidents:
-                    svc = incidents[0].get("service", "")
-                    if svc:
-                        return {"name": svc}
-                return {"name": query}
-            return _build
+        def build_entity_lookup(prior):
+            incidents = prior.get(1, {}).get("data", [])
+            if incidents:
+                svc = incidents[0].get("service", "")
+                if svc:
+                    return {"name": svc}
+            return {"name": query}
 
         steps.append(
             ExecutionStep(
-                step_id=3,
-                tool="entity_lookup",
+                step_id=3, tool="entity_lookup",
                 description="Look up entity for ownership context",
-                params_builder=build_entity_lookup(None),
+                rationale="Documentation found. Now identifying who owns the affected service.",
+                params_builder=build_entity_lookup,
                 depends_on=[1],
                 result_key="entity_owner",
             )
         )
         return ExecutionPlan(steps)
 
-    def _plan_multi_hop(self, query: str, filters: dict | None, time_range: tuple | None) -> ExecutionPlan:
-        """Full multi-hop: incidents → extract hosts/services → enrichment → docs.
-
-        This is the most complex plan and closest to real multi-hop.
-        """
+    def _plan_multi_hop(self, query: str, filters: dict | None, time_range: tuple | None):
+        
         steps = [
             ExecutionStep(
-                step_id=1,
-                tool="get_incidents",
+                step_id=1, tool="get_incidents",
                 description="Fetch incidents in time range",
+                rationale="Multi-hop: start with incidents to establish the event timeline.",
                 params={"time_range": time_range, "limit": 20},
                 result_key="incidents",
             ),
-        ]
-
-        # Step 2: vector search for context (parallel to step 1)
-        steps.append(
             ExecutionStep(
-                step_id=2,
-                tool="search_vector",
+                step_id=2, tool="search_vector",
                 description="Search for relevant documentation",
+                rationale="Running doc search in parallel with incident fetch (no dependency).",
                 params={"query": query, "filters": filters, "time_range": time_range, "top_k": 15},
                 result_key="vector_docs",
-            )
-        )
+            ),
+        ]
 
-        # Step 3: enrich with entity details (depends on step 1)
-        def build_enrichment(params_builder):
-            def _build(prior):
-                incidents = prior.get(1, {}).get("data", [])
-                if incidents:
-                    services = list(set(
-                        inc.get("service") for inc in incidents if inc.get("service")
-                    ))
-                    if services:
-                        return {"name": services[0]}
-                return {"name": self._extract_entity_name(query)}
-            return _build
+        def build_enrichment(prior):
+            incidents = prior.get(1, {}).get("data", [])
+            if incidents:
+                services = list(set(
+                    inc.get("service") for inc in incidents if inc.get("service")
+                ))
+                if services:
+                    return {"name": services[0]}
+            return {"name": self._extract_entity_name(query)}
 
         steps.append(
             ExecutionStep(
-                step_id=3,
-                tool="entity_lookup",
+                step_id=3, tool="entity_lookup",
                 description="Look up entity from incidents",
-                params_builder=build_enrichment(None),
+                rationale="Incidents mention services. Enriching with ownership details.",
+                params_builder=build_enrichment,
                 depends_on=[1],
                 result_key="entity_detail",
             )
         )
 
-        # Step 4: keyword search for precision terms (depends on step 1)
-        def build_keyword(params_builder):
-            def _build(prior):
-                incidents = prior.get(1, {}).get("data", [])
-                terms = []
-                for inc in incidents[:3]:
-                    if inc.get("root_cause"):
-                        terms.append(inc["root_cause"])
-                keyword_q = " ".join(terms[:3]) if terms else query
-                return {"query": keyword_q, "top_k": 10}
-            return _build
+        def build_keyword(prior):
+            incidents = prior.get(1, {}).get("data", [])
+            terms = []
+            for inc in incidents[:3]:
+                if inc.get("root_cause"):
+                    terms.append(inc["root_cause"])
+            return {"query": " ".join(terms[:3]) if terms else query, "top_k": 10}
 
         steps.append(
             ExecutionStep(
-                step_id=4,
-                tool="search_keyword",
+                step_id=4, tool="search_keyword",
                 description="Keyword search for precise root cause terms",
-                params_builder=build_keyword(None),
+                rationale="Root cause terms extracted from incidents. Using keyword search for precision matching.",
+                params_builder=build_keyword,
                 depends_on=[1],
                 result_key="keyword_results",
             )
         )
-
         return ExecutionPlan(steps)
 
-    def _plan_host_status(self, query: str, filters: dict | None, time_range: tuple | None) -> ExecutionPlan:
-        """SQL query for hosts, optional incident enrichment."""
-        steps = [
+    def _plan_host_status(self, query: str, filters: dict | None, time_range: tuple | None):
+        
+        return ExecutionPlan([
             ExecutionStep(
-                step_id=1,
-                tool="query_sql",
+                step_id=1, tool="query_sql",
                 description="Query hosts and services",
+                rationale="Direct SQL query for host inventory — fastest path to host data.",
                 params={"query": """
                     SELECT h.hostname, h.ip_address, h.environment, h.region, h.is_active,
                            s.name as service_name
@@ -397,35 +816,34 @@ class QueryPlanner:
                 """},
                 result_key="hosts",
             ),
-        ]
-        return ExecutionPlan(steps)
+        ])
 
-    def _plan_exploratory(self, query: str, filters: dict | None, time_range: tuple | None) -> ExecutionPlan:
-        """Broad exploration: vector search + recent incidents."""
+    def _plan_exploratory(self, query: str, filters: dict | None, time_range: tuple | None):
+        
         return ExecutionPlan([
             ExecutionStep(
-                step_id=1,
-                tool="search_vector",
+                step_id=1, tool="search_vector",
                 description="Semantic search for relevant content",
+                rationale="Exploratory query. Semantic search casts the widest net.",
                 params={"query": query, "filters": filters, "time_range": time_range, "top_k": 15},
                 result_key="vector_docs",
             ),
             ExecutionStep(
-                step_id=2,
-                tool="get_incidents",
+                step_id=2, tool="get_incidents",
                 description="Fetch recent incidents",
+                rationale="Also fetching recent incidents for complete picture.",
                 params={"time_range": time_range, "limit": 10, "severity": filters.get("severity") if filters else None},
                 result_key="incidents",
             ),
         ])
 
-    def _plan_comparative(self, query: str, filters: dict | None, time_range: tuple | None) -> ExecutionPlan:
-        """Compare incidents across dimensions — requires SQL + vector."""
+    def _plan_comparative(self, query: str, filters: dict | None, time_range: tuple | None):
+        
         return ExecutionPlan([
             ExecutionStep(
-                step_id=1,
-                tool="query_sql",
+                step_id=1, tool="query_sql",
                 description="Query incidents grouped by service",
+                rationale="Comparison requires structured aggregation. SQL is the right tool.",
                 params={"query": """
                     SELECT s.name as service, i.severity, i.status, COUNT(*) as count
                     FROM incidents i
@@ -437,118 +855,57 @@ class QueryPlanner:
                 result_key="sql_comparison",
             ),
             ExecutionStep(
-                step_id=2,
-                tool="search_vector",
+                step_id=2, tool="search_vector",
                 description="Search docs for comparison context",
+                rationale="Structured data retrieved. Adding doc context for qualitative comparison.",
                 params={"query": query, "top_k": 10},
                 result_key="vector_context",
             ),
         ])
 
-    # ── Execution ────────────────────────────────────────────────────────────
-
-    async def execute(
-        self,
-        plan: ExecutionPlan,
-        base_filters: dict[str, Any] | None = None,
-        base_time_range: tuple | None = None,
-    ) -> dict[int, Any]:
-        """Execute a plan step-by-step, injecting prior results into dependent steps.
-
-        Returns: dict[step_id, tool_result]
-        """
-        results: dict[int, Any] = {}
-        ordered = plan.topological_order()
-
-        logger.info("Executing plan with %d steps", len(ordered))
-        for step in ordered:
-            logger.info("  Step %d: %s → %s", step.step_id, step.tool, step.description)
-
-            # Check condition
-            if step.condition and not step.condition(results):
-                logger.info("  Step %d skipped (condition not met)", step.step_id)
-                results[step.step_id] = {"success": True, "data": [], "skipped": True}
-                continue
-
-            # Get tool
-            tool = ToolRegistry.get(step.tool)
-            if not tool:
-                logger.warning("  Tool '%s' not found, skipping step %d", step.tool, step.step_id)
-                results[step.step_id] = {"success": False, "data": [], "error": f"Tool '{step.tool}' not found"}
-                continue
-
-            # Build params — dynamic injection from prior results
-            params = step.build_params(results)
-            # Inject base filters/time_range if not explicitly overridden
-            if base_filters and "filters" not in params:
-                params.setdefault("filters", base_filters)
-            if base_time_range and "time_range" not in params:
-                params.setdefault("time_range", base_time_range)
-
-            # Execute
-            try:
-                result = await tool.run(**params)
-                results[step.step_id] = result
-                logger.info("  Step %d result: %s", step.step_id, {
-                    "success": result.get("success"),
-                    "count": result.get("result_count", len(result.get("data", []))),
-                })
-            except Exception as e:
-                logger.exception("  Step %d failed: %s", step.step_id, e)
-                results[step.step_id] = {"success": False, "data": [], "error": str(e)}
-
-        return results
-
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    # ── Entity Extraction ─────────────────────────────────────────────────
 
     @staticmethod
     def _extract_entity_name(query: str) -> str:
-        """Naive entity name extraction from query text."""
-        # Strip common prefixes
+        """Extract entity name from a query string."""
         q = query.strip().rstrip("?.")
-        for prefix in ["who owns ", "who is ", "what is ", "find ", "about ",
-                        "what services does ", "what hosts does ", "what incidents "]:
+        for prefix in [
+            "who owns ", "who is ", "what is ", "find ", "about ",
+            "what services does ", "what hosts does ", "what incidents ",
+            "tell me about ",
+        ]:
             if q.lower().startswith(prefix):
                 q = q[len(prefix):]
 
-        # Remove common stop words at the start
         for stop in ["the ", "a ", "an "]:
             if q.lower().startswith(stop):
                 q = q[len(stop):]
 
-        # If there's a quoted term, use it
-        import re
         quoted = re.findall(r'"([^"]+)"', q)
         if quoted:
             return quoted[0]
 
         words = q.split()
-        # Try uppercase words first (proper names)
         proper = [w for w in words if w[0].isupper()]
         if proper:
             return " ".join(proper[:3])
 
-        # Fallback: words adjacent to entity-indicating keywords
-        entity_keywords = {"team", "service", "host", "user", "incident", "system",
-                           "gateway", "database", "server", "cluster", "api"}
+        entity_kw = {"team", "service", "host", "user", "incident", "system",
+                      "gateway", "database", "server", "cluster", "api"}
         for i, w in enumerate(words):
             stripped = w.strip(",;:").lower()
-            if stripped in entity_keywords:
-                # Check word before the keyword (e.g. "platform team" → "platform")
+            if stripped in entity_kw:
                 if i > 0:
                     candidate = words[i - 1].strip(",;:")
-                    if len(candidate) > 2 and not candidate.lower() in {"the", "a", "an", "this", "that", "our", "your"}:
+                    if len(candidate) > 2 and candidate.lower() not in {"the","a","an","this","that","our","your"}:
                         return candidate
-                # Check word after the keyword (e.g. "service payment-gateway" → "payment-gateway")
                 if i + 1 < len(words):
                     return words[i + 1].strip(",;:")
 
-        # Look for hyphenated compound names (common in service names)
         compounds = [w.strip("?.,!:;") for w in words if "-" in w and len(w) > 3]
         if compounds:
             return compounds[0]
 
-        # Last resort: first 2-3 meaningful alpha words
         meaningful = [w for w in words if len(w) > 2 and w.isalpha()]
         if meaningful:
             return " ".join(meaningful[:2])

@@ -1,18 +1,64 @@
 """Cross-encoder reranker — re-ranks retrieval candidates for precision.
 
-Uses a cross-encoder model (e.g. BAAI/bge-reranker-v2-m3 or cross-encoder/ms-marco-MiniLM-L-6-v2)
-to score query-document pairs jointly, producing more accurate relevance than embedding cosine similarity.
+Uses a cross-encoder model (e.g. BAAI/bge-reranker-v2-m3 or
+cross-encoder/ms-marco-MiniLM-L-6-v2) to score query-document pairs jointly,
+producing more accurate relevance than embedding cosine similarity.
 
-This is the single highest-leverage quality improvement for any retrieval system.
+The pipeline is:
+
+    vector results + BM25 results
+        → merge + deduplicate
+        → cross-encoder reranker
+        → all results with scores (caller picks top-k)
 """
 
 import logging
 from typing import Any
 
-from app.config import get_settings
-
 logger = logging.getLogger(__name__)
-settings = get_settings()
+
+
+def merge_and_dedup(
+    vector_results: list[dict[str, Any]],
+    keyword_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge two ranked lists, deduplicating by content digest.
+
+    Uses content hash for dedup so identical docs from vector + BM25
+    are not double-counted. The higher-ranked entry (from vector, which
+    is typically more relevant) wins ties.
+    """
+    seen_content: set[str] = set()
+    seen_ids: set[str] = set()
+    merged: list[dict[str, Any]] = []
+
+    def is_duplicate(item: dict[str, Any]) -> bool:
+        content = item.get("content", "")[:300].strip()
+        doc_id = item.get("id", "")
+        if content and content in seen_content:
+            return True
+        if doc_id and doc_id in seen_ids:
+            return True
+        if content:
+            seen_content.add(content)
+        if doc_id:
+            seen_ids.add(doc_id)
+        return False
+
+    # Vector results first (higher confidence)
+    for item in vector_results:
+        if not is_duplicate(item):
+            item["source_rank"] = "vector"
+            merged.append(item)
+
+    # Then BM25 results
+    for item in keyword_results:
+        if not is_duplicate(item):
+            item["source_rank"] = "bm25"
+            merged.append(item)
+
+    logger.debug("Merged %d vector + %d bm25 → %d unique", len(vector_results), len(keyword_results), len(merged))
+    return merged
 
 
 class CrossEncoderReranker:
@@ -20,8 +66,9 @@ class CrossEncoderReranker:
 
     Usage:
         reranker = CrossEncoderReranker()
-        results = retriever.search(query, top_k=50)
-        reranked = reranker.rerank(query, results, top_k=5)
+        merged = merge_and_dedup(vector_results, keyword_results)
+        all_scored = reranker.score(query, merged)       # all with rerank_score
+        top_k = all_scored[:top_k]                        # caller picks k
     """
 
     def __init__(self, model_name: str | None = None):
@@ -39,29 +86,28 @@ class CrossEncoderReranker:
         except Exception as e:
             logger.warning(
                 "Failed to load cross-encoder '%s': %s. "
-                "Falling back to identity rerank (no reranking). "
-                "Install with: pip install sentence-transformers",
+                "Falling back to identity scoring (no reranking).",
                 self.model_name, e,
             )
             self._model = None
 
-    def rerank(
+    def score(
         self,
         query: str,
         candidates: list[dict[str, Any]],
-        top_k: int = 10,
-        min_score: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Rerank candidate documents by cross-encoder relevance.
+        """Score all candidates by cross-encoder relevance.
+
+        Returns the FULL list of candidates with 'rerank_score' attached,
+        sorted by score descending. Caller decides top-k.
 
         Args:
             query: The search query.
             candidates: List of dicts, each with at least {'content': str, ...}.
-            top_k: Number of results to keep after reranking.
-            min_score: Optional minimum score threshold (0-1 range, model-specific).
 
         Returns:
-            Candidates sorted by relevance (highest first), with 'rerank_score' added.
+            All candidates sorted by relevance (highest first), each with
+            'rerank_score' (float) and 'rerank_rank' (int) added.
         """
         if not candidates:
             return []
@@ -69,16 +115,16 @@ class CrossEncoderReranker:
         self._load_model()
 
         if self._model is None:
-            # No model available — return as-is with identity score
+            # No model — assign identity scores based on position
             for i, c in enumerate(candidates):
-                c["rerank_score"] = c.get("score", 1.0 / (i + 1))
-            return candidates[:top_k]
+                c["rerank_score"] = 1.0 / (i + 1)
+                c["rerank_rank"] = i + 1
+            return candidates
 
-        # Build query-document pairs
+        # Build query-document pairs with truncation
         pairs = []
         for c in candidates:
             content = c.get("content", "")
-            # Truncate to avoid blowing the model's max length
             if len(content) > 2000:
                 content = content[:2000]
             pairs.append((query, content))
@@ -88,19 +134,38 @@ class CrossEncoderReranker:
         except Exception as e:
             logger.error("Reranker prediction failed: %s", e)
             for i, c in enumerate(candidates):
-                c["rerank_score"] = c.get("score", 1.0 / (i + 1))
-            return candidates[:top_k]
+                c["rerank_score"] = 1.0 / (i + 1)
+                c["rerank_rank"] = i + 1
+            return candidates
 
-        # Attach scores and sort
+        # Attach scores
         for c, s in zip(candidates, scores):
             c["rerank_score"] = float(s)
 
+        # Sort by score descending
         candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
 
-        if min_score is not None:
-            candidates = [c for c in candidates if c["rerank_score"] >= min_score]
+        # Assign ranks
+        for i, c in enumerate(candidates):
+            c["rerank_rank"] = i + 1
 
-        return candidates[:top_k]
+        return candidates
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[dict[str, Any]],
+        top_k: int = 10,
+        min_score: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Convenience: score then return top-k.
+
+        Prefer score() when you want the full ranked list.
+        """
+        all_scored = self.score(query, candidates)
+        if min_score is not None:
+            all_scored = [c for c in all_scored if c["rerank_score"] >= min_score]
+        return all_scored[:top_k]
 
 
 # Singleton for app-wide use
