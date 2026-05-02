@@ -1,0 +1,45 @@
+2026-04-15T14:30:15Z pay-web-01 payment-gateway ERROR connection to server at 10.0.1.20:5432 failed: FATAL: remaining connection slots are reserved for non-replication superuser connections
+2026-04-15T14:30:17Z pay-web-02 payment-gateway ERROR connection to server at 10.0.1.20:5432 failed: FATAL: remaining connection slots are reserved for non-replication superuser connections
+2026-04-15T14:30:20Z pay-web-01 payment-gateway WARN payment processing queue depth: 847, max healthy: 100
+2026-04-15T14:30:22Z pay-web-01 payment-gateway ERROR Unable to process payment txn_9a82f: DB connection unavailable
+2026-04-15T14:30:25Z pay-web-02 payment-gateway ERROR Unable to process payment txn_9a83b: DB connection unavailable
+2026-04-15T14:30:30Z pay-web-01 payment-gateway CRITICAL Error rate exceeded 40% threshold, triggering PagerDuty escalation
+2026-04-15T14:31:00Z pay-web-01 payment-gateway INFO PgBouncer starting sidecar deployment
+2026-04-15T14:31:30Z pay-db-01 payment-gateway INFO max_connections increased from 50 to 200
+2026-04-15T14:32:00Z pay-web-01 payment-gateway INFO PgBouncer sidecar ready, accepting connections
+2026-04-15T14:32:30Z pay-web-01 payment-gateway INFO Queue depth dropping: 620
+2026-04-15T14:33:00Z pay-web-01 payment-gateway INFO Queue depth dropping: 380
+2026-04-15T14:34:00Z pay-web-01 payment-gateway INFO Queue depth: 120, error rate: 5%
+2026-04-15T14:35:00Z pay-web-01 payment-gateway INFO Queue depth: 45, error rate: 1.2%
+2026-04-15T14:36:00Z pay-web-01 payment-gateway INFO Service recovered. All metrics within normal range.
+2026-04-15T14:30:40Z usr-api-01 user-service WARN Redis connection timeout — retrying (attempt 1/3)
+2026-04-15T14:30:43Z usr-api-01 user-service WARN Redis connection timeout — retrying (attempt 2/3)
+2026-04-15T14:30:46Z usr-api-01 user-service ERROR Redis cluster unavailable after 3 retries. Failover in progress.
+2026-04-15T14:30:50Z usr-api-02 user-service WARN Cache miss rate: 94% (normal: <15%). Latency impact expected.
+2026-04-15T14:31:10Z usr-api-01 user-service WARN P99 latency at 3200ms (normal: 50ms)
+2026-04-15T14:31:20Z usr-api-02 user-service INFO Redis failover complete. New primary elected: usr-redis-01-replica
+2026-04-15T14:31:30Z usr-api-01 user-service INFO Cache warming job started
+2026-04-15T14:32:00Z usr-api-02 user-service INFO Cache hit rate recovering: 45%
+2026-04-15T14:32:30Z usr-api-01 user-service INFO Cache hit rate: 72%. P99 latency: 450ms
+2026-04-15T14:33:00Z usr-api-02 user-service INFO Cache hit rate: 88%. P99 latency: 120ms
+2026-04-15T14:35:00Z usr-api-01 user-service INFO Service fully recovered. Cache warmed.
+2026-04-10T08:00:05Z notify-01 notification-service INFO Promotional email campaign starting: 200k emails
+2026-04-10T08:05:00Z notify-01 notification-service INFO 15k emails sent. Rate: 50/s
+2026-04-10T08:10:00Z notify-02 notification-service WARN SES Throttling — Rate exceeded. 50000 requests throttled.
+2026-04-10T08:12:00Z notify-01 notification-service ERROR SES returned Throttling error for batch-47
+2026-04-10T08:15:00Z notify-02 notification-service WARN Delivery queue depth: 185k and growing
+2026-04-10T08:20:00Z notify-01 notification-service INFO Implementing exponential backoff: initial delay 1s, max 30s
+2026-04-10T08:25:00Z notify-01 notification-service INFO SES rate limit increase requested: 50/s → 500/s
+2026-04-10T08:30:00Z notify-02 notification-service INFO Backoff working. 200 emails/s being accepted.
+2026-04-10T08:45:00Z notify-01 notification-service INFO Rate limit increase approved. New limit: 500/s
+2026-04-10T08:50:00Z notify-02 notification-service INFO Queue draining: 45k remaining
+2026-04-10T09:00:00Z notify-01 notification-service INFO Queue empty. All 200k emails delivered.
+2026-04-08T11:00:00Z search-01 search-service WARN Search response time degraded: avg 1200ms (baseline: 150ms)
+2026-04-08T11:01:00Z search-02 search-service WARN Elasticsearch cluster status: YELLOW
+2026-04-08T11:02:00Z search-01 search-service WARN Node search-data-03 disk usage: 97%
+2026-04-08T11:05:00Z search-02 search-service INFO Partial results returned for query "popular products"
+2026-04-08T11:10:00Z search-01 search-service WARN 15 shards unassigned due to disk threshold
+2026-04-08T11:20:00Z search-01 search-service INFO Old indices cleanup started: removing indices older than 30 days
+2026-04-08T11:25:00Z search-01 search-service INFO Cleanup freed 40GB. Shards reassigning.
+2026-04-08T11:28:00Z search-02 search-service INFO Elasticsearch cluster status: GREEN
+2026-04-08T11:30:00Z search-01 search-service INFO Response time recovered: 180ms avg

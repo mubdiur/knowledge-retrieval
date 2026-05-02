@@ -1,0 +1,84 @@
+{
+  "services": [
+    {
+      "name": "payment-gateway",
+      "description": "Handles payment processing, fraud detection, and refunds",
+      "owner": "alice@company.com",
+      "team": "Payments Squad",
+      "environment": "production",
+      "repository": "github.com/company/payment-gateway",
+      "hosts": [
+        {"hostname": "pay-web-01.prod", "ip": "10.0.1.10", "region": "us-west-2", "provider": "aws"},
+        {"hostname": "pay-web-02.prod", "ip": "10.0.1.11", "region": "us-west-2", "provider": "aws"},
+        {"hostname": "pay-db-01.prod", "ip": "10.0.1.20", "region": "us-west-2", "provider": "aws"}
+      ]
+    },
+    {
+      "name": "user-service",
+      "description": "Authentication, authorization, user profiles and preferences",
+      "owner": "bob@company.com",
+      "team": "Platform Team",
+      "environment": "production",
+      "repository": "github.com/company/user-service",
+      "hosts": [
+        {"hostname": "usr-api-01.prod", "ip": "10.0.2.10", "region": "us-east-1", "provider": "aws"},
+        {"hostname": "usr-api-02.prod", "ip": "10.0.2.11", "region": "us-east-1", "provider": "aws"},
+        {"hostname": "usr-redis-01.prod", "ip": "10.0.2.30", "region": "us-east-1", "provider": "aws"}
+      ]
+    },
+    {
+      "name": "notification-service",
+      "description": "Email, SMS, push notification delivery and templates",
+      "owner": "carol@company.com",
+      "team": "Platform Team",
+      "environment": "production",
+      "repository": "github.com/company/notification-service",
+      "hosts": [
+        {"hostname": "notify-01.prod", "ip": "10.0.3.10", "region": "eu-west-1", "provider": "aws"},
+        {"hostname": "notify-02.prod", "ip": "10.0.3.11", "region": "eu-west-1", "provider": "aws"}
+      ]
+    },
+    {
+      "name": "inventory-service",
+      "description": "Product catalog, stock management, warehouse integration",
+      "owner": "dave@company.com",
+      "team": "Commerce Team",
+      "environment": "staging",
+      "repository": "github.com/company/inventory-service",
+      "hosts": [
+        {"hostname": "inv-api-01.staging", "ip": "10.0.4.10", "region": "us-west-2", "provider": "aws"},
+        {"hostname": "inv-db-01.staging", "ip": "10.0.4.20", "region": "us-west-2", "provider": "aws"}
+      ]
+    },
+    {
+      "name": "search-service",
+      "description": "Product search, autocomplete, and recommendations",
+      "owner": "eve@company.com",
+      "team": "Commerce Team",
+      "environment": "production",
+      "repository": "github.com/company/search-service",
+      "hosts": [
+        {"hostname": "search-01.prod", "ip": "10.0.5.10", "region": "us-east-1", "provider": "aws"},
+        {"hostname": "search-02.prod", "ip": "10.0.5.11", "region": "us-east-1", "provider": "aws"}
+      ]
+    }
+  ],
+
+  "teams": [
+    {"name": "Payments Squad", "channel": "#payments-squad", "description": "Owns payment processing and fraud"},
+    {"name": "Platform Team", "channel": "#platform", "description": "Core platform, auth, notifications"},
+    {"name": "Commerce Team", "channel": "#commerce", "description": "Product catalog, search, cart"},
+    {"name": "SRE Team", "channel": "#sre-alerts", "description": "Infrastructure reliability and observability"},
+    {"name": "Security Team", "channel": "#security", "description": "Security audits and incident response"}
+  ],
+
+  "users": [
+    {"name": "Alice Wang", "email": "alice@company.com", "role": "Senior Engineer", "slack": "@alice"},
+    {"name": "Bob Martinez", "email": "bob@company.com", "role": "Staff Engineer", "slack": "@bob"},
+    {"name": "Carol Chen", "email": "carol@company.com", "role": "Engineer", "slack": "@carol"},
+    {"name": "Dave Kim", "email": "dave@company.com", "role": "Engineer", "slack": "@dave"},
+    {"name": "Eve Thompson", "email": "eve@company.com", "role": "Senior Engineer", "slack": "@eve"},
+    {"name": "Frank Okafor", "email": "frank@company.com", "role": "SRE Lead", "slack": "@frank"},
+    {"name": "Grace Lee", "email": "grace@company.com", "role": "Engineering Manager", "slack": "@grace"}
+  ]
+}

@@ -1,0 +1,118 @@
+[
+  {
+    "title": "Payment Gateway Outage — Elevated Error Rates",
+    "severity": "critical",
+    "status": "resolved",
+    "service": "payment-gateway",
+    "team": "Payments Squad",
+    "reported_by": "alice@company.com",
+    "root_cause": "Database connection pool exhaustion due to sudden traffic spike from flash sale",
+    "resolution": "Increased max_connections from 50 to 200 and added connection pooling with PgBouncer",
+    "started_at": "2026-04-15T14:32:00Z",
+    "detected_at": "2026-04-15T14:35:00Z",
+    "mitigated_at": "2026-04-15T15:10:00Z",
+    "resolved_at": "2026-04-15T15:45:00Z",
+    "impacted_hosts": ["pay-web-01.prod", "pay-web-02.prod", "pay-db-01.prod"],
+    "tags": ["flash-sale", "database", "connection-pool"],
+    "timeline": [
+      {"timestamp": "2026-04-15T14:32:00Z", "type": "detection", "content": "Error rate spiked to 45% on payment-gateway. PagerDuty alert triggered.", "actor": "monitoring"},
+      {"timestamp": "2026-04-15T14:35:00Z", "type": "escalation", "content": "Alice Wang acknowledged alert. Payments Squad paged.", "actor": "@alice"},
+      {"timestamp": "2026-04-15T14:42:00Z", "type": "note", "content": "Identified database connection pool exhaustion. 50 connections saturated, 800+ queued.", "actor": "@alice"},
+      {"timestamp": "2026-04-15T14:55:00Z", "type": "mitigation", "content": "Increased max_connections to 200. Rolled out PgBouncer sidecar.", "actor": "@alice"},
+      {"timestamp": "2026-04-15T15:10:00Z", "type": "mitigation", "content": "Error rate dropped to 2%. Service stabilizing.", "actor": "monitoring"},
+      {"timestamp": "2026-04-15T15:45:00Z", "type": "resolution", "content": "All metrics normal. Incident resolved.", "actor": "@alice"}
+    ]
+  },
+  {
+    "title": "User Service Latency Spike — Redis Cluster Failover",
+    "severity": "major",
+    "status": "resolved",
+    "service": "user-service",
+    "team": "Platform Team",
+    "reported_by": "bob@company.com",
+    "root_cause": "Redis cluster node failure triggered automatic failover with cache miss storm",
+    "resolution": "Pre-warmed cache after failover and added Redis sentinel monitoring alerts",
+    "started_at": "2026-04-12T09:15:00Z",
+    "detected_at": "2026-04-12T09:18:00Z",
+    "mitigated_at": "2026-04-12T09:40:00Z",
+    "resolved_at": "2026-04-12T10:00:00Z",
+    "impacted_hosts": ["usr-api-01.prod", "usr-api-02.prod", "usr-redis-01.prod"],
+    "tags": ["redis", "cache", "latency", "failover"],
+    "timeline": [
+      {"timestamp": "2026-04-12T09:15:00Z", "type": "detection", "content": "P99 latency on user-service spiked from 50ms to 4500ms. Datadog alert fired.", "actor": "monitoring"},
+      {"timestamp": "2026-04-12T09:18:00Z", "type": "escalation", "content": "Bob Martinez investigating.", "actor": "@bob"},
+      {"timestamp": "2026-04-12T09:25:00Z", "type": "note", "content": "Redis cluster primary node went down. Automatic failover to replica completed. Cache miss storm in progress.", "actor": "@bob"},
+      {"timestamp": "2026-04-12T09:35:00Z", "type": "mitigation", "content": "Cache warming job triggered. Redis sentinel monitoring enabled.", "actor": "@bob"},
+      {"timestamp": "2026-04-12T09:40:00Z", "type": "mitigation", "content": "Latency dropping to 120ms P99. Cache hit rate recovering.", "actor": "monitoring"},
+      {"timestamp": "2026-04-12T10:00:00Z", "type": "resolution", "content": "All services normal. Redis cluster stable.", "actor": "@bob"}
+    ]
+  },
+  {
+    "title": "Notification Delivery Failure — SES Rate Limit",
+    "severity": "major",
+    "status": "resolved",
+    "service": "notification-service",
+    "team": "Platform Team",
+    "reported_by": "carol@company.com",
+    "root_cause": "AWS SES sending rate limit exceeded during promotional campaign",
+    "resolution": "Implemented exponential backoff and requested SES rate limit increase from 50/s to 500/s",
+    "started_at": "2026-04-10T08:00:00Z",
+    "detected_at": "2026-04-10T08:15:00Z",
+    "mitigated_at": "2026-04-10T08:50:00Z",
+    "resolved_at": "2026-04-10T09:30:00Z",
+    "impacted_hosts": ["notify-01.prod", "notify-02.prod"],
+    "tags": ["ses", "email", "rate-limit", "campaign"],
+    "timeline": [
+      {"timestamp": "2026-04-10T08:00:00Z", "type": "detection", "content": "Promotional campaign started. 200k emails queued.", "actor": "system"},
+      {"timestamp": "2026-04-10T08:15:00Z", "type": "detection", "content": "SES returned Throttling errors. Delivery queue backing up.", "actor": "monitoring"},
+      {"timestamp": "2026-04-10T08:20:00Z", "type": "escalation", "content": "Carol Chen investigating SES rate limits.", "actor": "@carol"},
+      {"timestamp": "2026-04-10T08:35:00Z", "type": "mitigation", "content": "Implemented exponential backoff and queuing. Requested SES rate limit increase.", "actor": "@carol"},
+      {"timestamp": "2026-04-10T08:50:00Z", "type": "mitigation", "content": "Backlog clearing. Delivery rate recovering.", "actor": "monitoring"},
+      {"timestamp": "2026-04-10T09:30:00Z", "type": "resolution", "content": "All emails delivered. Rate limit increase approved.", "actor": "@carol"}
+    ]
+  },
+  {
+    "title": "Search Service Degraded — Elasticsearch Cluster Yellow",
+    "severity": "minor",
+    "status": "resolved",
+    "service": "search-service",
+    "team": "Commerce Team",
+    "reported_by": "eve@company.com",
+    "root_cause": "One Elasticsearch data node ran out of disk space during reindexing",
+    "resolution": "Added disk space and rebalanced shards across nodes",
+    "started_at": "2026-04-08T11:00:00Z",
+    "detected_at": "2026-04-08T11:05:00Z",
+    "mitigated_at": "2026-04-08T11:30:00Z",
+    "resolved_at": "2026-04-08T12:00:00Z",
+    "impacted_hosts": ["search-01.prod", "search-02.prod"],
+    "tags": ["elasticsearch", "disk", "search"],
+    "timeline": [
+      {"timestamp": "2026-04-08T11:00:00Z", "type": "detection", "content": "Search response times increased by 200%. Partial results for some queries.", "actor": "monitoring"},
+      {"timestamp": "2026-04-08T11:05:00Z", "type": "escalation", "content": "Eve Thompson investigating.", "actor": "@eve"},
+      {"timestamp": "2026-04-08T11:15:00Z", "type": "note", "content": "ES cluster status yellow. One data node disk 97% full.", "actor": "@eve"},
+      {"timestamp": "2026-04-08T11:30:00Z", "type": "mitigation", "content": "Cleared old indices. Freed 40GB disk space. Cluster back to green.", "actor": "@eve"},
+      {"timestamp": "2026-04-08T12:00:00Z", "type": "resolution", "content": "Search performance restored. Added disk monitoring alert.", "actor": "@eve"}
+    ]
+  },
+  {
+    "title": "Inventory Sync Failure — Warehouse API Timeout",
+    "severity": "minor",
+    "status": "open",
+    "service": "inventory-service",
+    "team": "Commerce Team",
+    "reported_by": "dave@company.com",
+    "root_cause": "Third-party warehouse API timeout during peak hours",
+    "resolution": "Pending — evaluating fallback cache and retry strategy",
+    "started_at": "2026-04-18T16:00:00Z",
+    "detected_at": "2026-04-18T16:10:00Z",
+    "mitigated_at": null,
+    "resolved_at": null,
+    "impacted_hosts": ["inv-api-01.staging"],
+    "tags": ["inventory", "third-party", "timeout", "staging"],
+    "timeline": [
+      {"timestamp": "2026-04-18T16:00:00Z", "type": "detection", "content": "Inventory sync job failed. Warehouse API returned 504 Gateway Timeout.", "actor": "monitoring"},
+      {"timestamp": "2026-04-18T16:10:00Z", "type": "escalation", "content": "Dave Kim investigating.", "actor": "@dave"},
+      {"timestamp": "2026-04-18T16:25:00Z", "type": "note", "content": "Third-party API consistently timing out between 16:00-17:00 UTC. Likely their peak load.", "actor": "@dave"}
+    ]
+  }
+]
