@@ -34,6 +34,12 @@ settings = get_settings()
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "sample")
 
 
+def _naive_utc(dt_str: str) -> datetime:
+    """Convert ISO datetime string to naive UTC datetime (for TIMESTAMP WITHOUT TIME ZONE columns)."""
+    dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    return dt.replace(tzinfo=None)
+
+
 async def seed_database(session_factory, reset: bool = False):
     """Populate PostgreSQL with sample data."""
     async with session_factory() as session:
@@ -140,10 +146,10 @@ async def seed_database(session_factory, reset: bool = False):
                 reported_by=user_map.get(reporter_email).id if reporter_email in user_map else None,
                 root_cause=inc_data.get("root_cause"),
                 resolution=inc_data.get("resolution"),
-                started_at=datetime.fromisoformat(inc_data["started_at"].replace("Z", "+00:00")),
-                detected_at=datetime.fromisoformat(inc_data["detected_at"].replace("Z", "+00:00")) if inc_data.get("detected_at") else None,
-                mitigated_at=datetime.fromisoformat(inc_data["mitigated_at"].replace("Z", "+00:00")) if inc_data.get("mitigated_at") else None,
-                resolved_at=datetime.fromisoformat(inc_data["resolved_at"].replace("Z", "+00:00")) if inc_data.get("resolved_at") else None,
+                started_at=_naive_utc(inc_data["started_at"]),
+                detected_at=_naive_utc(inc_data["detected_at"]) if inc_data.get("detected_at") else None,
+                mitigated_at=_naive_utc(inc_data["mitigated_at"]) if inc_data.get("mitigated_at") else None,
+                resolved_at=_naive_utc(inc_data["resolved_at"]) if inc_data.get("resolved_at") else None,
                 impacted_hosts=inc_data.get("impacted_hosts", []),
                 tags=inc_data.get("tags", []),
             )
@@ -153,7 +159,7 @@ async def seed_database(session_factory, reset: bool = False):
             for tl in inc_data.get("timeline", []):
                 timeline_entry = IncidentTimeline(
                     incident_id=incident.id,
-                    timestamp=datetime.fromisoformat(tl["timestamp"].replace("Z", "+00:00")),
+                    timestamp=_naive_utc(tl["timestamp"]),
                     entry_type=tl["type"],
                     content=tl["content"],
                     actor=tl.get("actor"),

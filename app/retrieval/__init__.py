@@ -1,12 +1,12 @@
 """Retrieval package — lazy imports for faster startup."""
 
-def VectorStore():
+def VectorStore(*a, **kw):
     from .vector_store import VectorStore as _cls
-    return _cls
+    return _cls(*a, **kw)
 
-def BM25Index():
+def BM25Index(*a, **kw):
     from .keyword_store import BM25Index as _cls
-    return _cls
+    return _cls(*a, **kw)
 
 def HybridRetriever(*a, **kw):
     from .hybrid import HybridRetriever as _cls

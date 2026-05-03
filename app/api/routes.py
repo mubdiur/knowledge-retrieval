@@ -27,7 +27,8 @@ async def query(request: QueryRequest) -> QueryResponse:
     if _orchestrator is None:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
-    logger.info("Query: %s (filters=%s, time_range=%s)", request.query[:100], request.filters, request.time_range)
+    logger.info("Query: %s (filters=%s, time_range=%s, conv=%s)",
+                request.query[:100], request.filters, request.time_range, request.conversation_id)
 
     try:
         response = await _orchestrator.answer(
@@ -36,6 +37,7 @@ async def query(request: QueryRequest) -> QueryResponse:
             time_range=request.time_range,
             top_k=request.top_k,
             enable_refinement=request.enable_refinement,
+            conversation_id=request.conversation_id,
         )
         return response
     except Exception as e:

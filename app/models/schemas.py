@@ -11,6 +11,7 @@ class QueryRequest(BaseModel):
     time_range: tuple[datetime, datetime] | None = Field(default=None, description="(start, end) UTC")
     top_k: int = Field(default=10, ge=1, le=100)
     enable_refinement: bool = Field(default=True, description="Allow iterative retrieval")
+    conversation_id: str | None = Field(default=None, description="Continue an existing conversation")
 
 
 class SourceRef(BaseModel):
@@ -62,3 +63,17 @@ class AgentContext(BaseModel):
     intermediate_results: list[dict] = []
     refinement_count: int = 0
     max_refinements: int = 3
+
+
+class ConversationTurn(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    query_type: str | None = None
+
+
+class Conversation(BaseModel):
+    id: str
+    turns: list[ConversationTurn] = []
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)

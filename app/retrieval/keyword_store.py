@@ -4,10 +4,12 @@ An in-memory BM25 index rebuilt on startup from the database chunk store.
 For production, consider Elasticsearch or Meilisearch instead.
 """
 
+import json
 import math
 import logging
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 from app.config import get_settings
@@ -16,11 +18,16 @@ logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
+DEFAULT_INDEX_PATH = "data/bm25_index.json"
+
 
 class BM25Index:
-    """Simple BM25 implementation for keyword search over chunks."""
+    """Simple BM25 implementation for keyword search over chunks.
 
-    def __init__(self, k1: float = 1.5, b: float = 0.75):
+    Supports incremental updates and persistence to disk.
+    """
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75, index_path: str | None = None):
         self.k1 = k1
         self.b = b
         self._documents: list[dict[str, Any]] = []
@@ -29,6 +36,8 @@ class BM25Index:
         self._avg_doc_len: float = 0.0
         self._num_docs: int = 0
         self._ready = False
+        self._index_path = Path(index_path or DEFAULT_INDEX_PATH)
+        self._load()
 
     # ── Tokenization ──────────────────────────────────────────────────────────
 
@@ -69,7 +78,109 @@ class BM25Index:
             )
 
         self._ready = True
+        self._save()
         logger.info("BM25 index built: %d docs, %d terms", self._num_docs, len(self._idf))
+
+    def add_documents(self, documents: list[dict[str, Any]]) -> None:
+        """Incrementally add documents to the BM25 index without full rebuild.
+
+        Recomputes IDF and avg doc length to include new documents.
+        """
+        if not documents:
+            return
+
+        new_total_len = self._avg_doc_len * self._num_docs if self._num_docs else 0
+
+        for doc in documents:
+            content = doc.get("content", "")
+            tokens = self.tokenize(content)
+            self._documents.append(doc)
+            self._doc_terms.append(Counter(tokens))
+            new_total_len += len(tokens)
+
+        self._num_docs = len(self._documents)
+        self._avg_doc_len = new_total_len / max(self._num_docs, 1)
+
+        # Recompute IDF with all documents
+        doc_freq: Counter = Counter()
+        for term_counts in self._doc_terms:
+            for term in term_counts:
+                doc_freq[term] += 1
+
+        self._idf = {}
+        for term, df in doc_freq.items():
+            self._idf[term] = math.log(
+                1 + (self._num_docs - df + 0.5) / (df + 0.5)
+            )
+
+        self._ready = True
+        self._save()
+        logger.info("BM25 index updated: %d docs (+%d), %d terms",
+                     self._num_docs, len(documents), len(self._idf))
+
+    # ── Persistence ──────────────────────────────────────────────────────────
+
+    def _save(self) -> None:
+        """Persist index to disk."""
+        try:
+            self._index_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "k1": self.k1,
+                "b": self.b,
+                "documents": self._documents,
+                "avg_doc_len": self._avg_doc_len,
+                "num_docs": self._num_docs,
+                "ready": self._ready,
+            }
+            self._index_path.write_text(json.dumps(data, default=str), encoding="utf-8")
+            logger.debug("BM25 index saved: %d docs", self._num_docs)
+        except Exception as e:
+            logger.warning("BM25 save failed: %s", e)
+
+    def _load(self) -> None:
+        """Load index from disk if it exists."""
+        if not self._index_path.exists():
+            return
+        try:
+            data = json.loads(self._index_path.read_text(encoding="utf-8"))
+            self.k1 = data.get("k1", self.k1)
+            self.b = data.get("b", self.b)
+            self._documents = data.get("documents", [])
+            self._avg_doc_len = data.get("avg_doc_len", 0.0)
+            self._num_docs = data.get("num_docs", 0)
+            self._ready = data.get("ready", False)
+
+            # Rebuild doc_terms and idf from loaded documents
+            self._doc_terms = []
+            total_len = 0
+            for doc in self._documents:
+                tokens = self.tokenize(doc.get("content", ""))
+                self._doc_terms.append(Counter(tokens))
+                total_len += len(tokens)
+
+            # Recompute IDF
+            doc_freq: Counter = Counter()
+            for term_counts in self._doc_terms:
+                for term in term_counts:
+                    doc_freq[term] += 1
+
+            self._idf = {}
+            for term, df in doc_freq.items():
+                self._idf[term] = math.log(
+                    1 + (self._num_docs - df + 0.5) / (df + 0.5)
+                )
+
+            self._ready = self._num_docs > 0
+            if self._ready:
+                logger.info("BM25 index loaded from disk: %d docs, %d terms", self._num_docs, len(self._idf))
+        except Exception as e:
+            logger.warning("BM25 load failed, starting fresh: %s", e)
+            self._documents = []
+            self._doc_terms = []
+            self._idf = {}
+            self._avg_doc_len = 0.0
+            self._num_docs = 0
+            self._ready = False
 
     def search(self, query: str, top_k: int = 10) -> list[dict[str, Any]]:
         """Return top-k results with BM25 scores."""

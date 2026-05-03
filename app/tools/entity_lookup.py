@@ -3,7 +3,7 @@
 import logging
 from typing import Any
 
-from sqlalchemy import select, or_
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.tools.base import BaseTool, ToolSpec, ToolRegistry
@@ -35,49 +35,75 @@ class EntityLookupTool(BaseTool):
 
     async def run(self, name: str, entity_type: str | None = None, **kwargs) -> dict[str, Any]:
         try:
-            from app.models.db import User, Service, Team, Host
-
             results = {}
+            pattern = f"%{name}%"
+
             async with self.session_factory() as session:
                 # Users
                 if entity_type in (None, "user"):
-                    stmt = select(User).where(
-                        or_(
-                            User.name.ilike(f"%{name}%"),
-                            User.email.ilike(f"%{name}%"),
-                        )
-                    ).limit(5)
-                    rows = (await session.execute(stmt)).scalars().all()
+                    stmt = text("""
+                        SELECT id, name, email, role
+                        FROM users
+                        WHERE name ILIKE :pattern OR email ILIKE :pattern
+                        LIMIT 5
+                    """).bindparams(pattern=pattern)
+                    rows = (await session.execute(stmt)).mappings().all()
                     results["users"] = [
-                        {"id": u.id, "name": u.name, "email": u.email, "role": u.role}
-                        for u in rows
+                        {"id": r["id"], "name": r["name"], "email": r["email"], "role": r["role"]}
+                        for r in rows
                     ]
 
-                # Services
+                # Services with owner and team names
                 if entity_type in (None, "service"):
-                    stmt = select(Service).where(Service.name.ilike(f"%{name}%")).limit(5)
-                    rows = (await session.execute(stmt)).scalars().all()
+                    stmt = text("""
+                        SELECT s.id, s.name, s.environment,
+                               u.name as owner_name, u.email as owner_email,
+                               t.name as team_name
+                        FROM services s
+                        LEFT JOIN users u ON s.owner_id = u.id
+                        LEFT JOIN teams t ON s.team_id = t.id
+                        WHERE s.name ILIKE :pattern
+                        LIMIT 5
+                    """).bindparams(pattern=pattern)
+                    rows = (await session.execute(stmt)).mappings().all()
                     results["services"] = [
-                        {"id": s.id, "name": s.name, "environment": s.environment.value if hasattr(s.environment, 'value') else s.environment}
-                        for s in rows
+                        {
+                            "id": r["id"],
+                            "name": r["name"],
+                            "environment": r["environment"],
+                            "owner": r["owner_name"],
+                            "owner_email": r["owner_email"],
+                            "team": r["team_name"],
+                        }
+                        for r in rows
                     ]
 
                 # Teams
                 if entity_type in (None, "team"):
-                    stmt = select(Team).where(Team.name.ilike(f"%{name}%")).limit(5)
-                    rows = (await session.execute(stmt)).scalars().all()
+                    stmt = text("""
+                        SELECT id, name, channel
+                        FROM teams
+                        WHERE name ILIKE :pattern
+                        LIMIT 5
+                    """).bindparams(pattern=pattern)
+                    rows = (await session.execute(stmt)).mappings().all()
                     results["teams"] = [
-                        {"id": t.id, "name": t.name, "channel": t.channel}
-                        for t in rows
+                        {"id": r["id"], "name": r["name"], "channel": r["channel"]}
+                        for r in rows
                     ]
 
                 # Hosts
                 if entity_type in (None, "host"):
-                    stmt = select(Host).where(Host.hostname.ilike(f"%{name}%")).limit(5)
-                    rows = (await session.execute(stmt)).scalars().all()
+                    stmt = text("""
+                        SELECT id, hostname, ip_address, environment
+                        FROM hosts
+                        WHERE hostname ILIKE :pattern
+                        LIMIT 5
+                    """).bindparams(pattern=pattern)
+                    rows = (await session.execute(stmt)).mappings().all()
                     results["hosts"] = [
-                        {"id": h.id, "hostname": h.hostname, "ip_address": h.ip_address, "environment": h.environment.value if hasattr(h.environment, 'value') else h.environment}
-                        for h in rows
+                        {"id": r["id"], "hostname": r["hostname"], "ip_address": r["ip_address"], "environment": r["environment"]}
+                        for r in rows
                     ]
 
             return {

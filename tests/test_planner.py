@@ -190,30 +190,34 @@ class TestQueryPlanner:
         c = self.planner._assess_confidence(results)
         assert c > 0.0
 
-    def test_generate_refinement_root_cause(self):
+    @pytest.mark.asyncio
+    async def test_generate_refinement_root_cause(self):
         obs = Observation(1, "get_incidents", True, 3, ["svc-a"], True, 0.5,
                           gap="Incidents found but root cause information missing")
-        step = self.planner._generate_refinement(5, obs, ["svc-a"], "what caused")
+        step = await self.planner._generate_refinement(5, obs, ["svc-a"], "what caused")
         assert step is not None
         assert step.tool == "search_vector"
         assert step.rationale
 
-    def test_generate_refinement_owner(self):
+    @pytest.mark.asyncio
+    async def test_generate_refinement_owner(self):
         obs = Observation(1, "entity_lookup", True, 1, [], True, 0.3,
                           gap="Need to identify owner/team for entity")
-        step = self.planner._generate_refinement(5, obs, [], "who owns payment")
+        step = await self.planner._generate_refinement(5, obs, [], "who owns payment")
         assert step is not None
         assert step.tool == "entity_lookup"
 
-    def test_generate_refinement_generic(self):
+    @pytest.mark.asyncio
+    async def test_generate_refinement_generic(self):
         obs = Observation(1, "tool", True, 0, [], False, 0.1, gap="No results found")
-        step = self.planner._generate_refinement(5, obs, [], "test")
+        step = await self.planner._generate_refinement(5, obs, [], "test")
         assert step is not None
         assert step.tool == "search_keyword"
 
-    def test_generate_refinement_no_gap(self):
+    @pytest.mark.asyncio
+    async def test_generate_refinement_no_gap(self):
         obs = Observation(1, "tool", True, 5, ["x"], True, 0.9, gap=None)
-        step = self.planner._generate_refinement(5, obs, [], "test")
+        step = await self.planner._generate_refinement(5, obs, [], "test")
         assert step is None
 
     def test_trace_log_structure(self):

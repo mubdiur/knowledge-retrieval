@@ -4,7 +4,7 @@ import logging
 from typing import Any
 
 from app.tools.base import BaseTool, ToolSpec, ToolRegistry
-from app.retrieval import VectorStore
+from app.retrieval import HybridRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 class VectorSearchTool(BaseTool):
     """Search over vector embeddings for semantically similar content."""
 
-    def __init__(self, vector_store: VectorStore):
-        self.vs = vector_store
+    def __init__(self, hybrid_retriever: HybridRetriever):
+        self.retriever = hybrid_retriever
 
     @property
     def spec(self) -> ToolSpec:
@@ -51,12 +51,13 @@ class VectorSearchTool(BaseTool):
         **kwargs,
     ) -> dict[str, Any]:
         try:
-            results = self.vs.search(
+            results = self.retriever.search(
                 collection="knowledge_docs",
                 query=query,
                 filters=filters,
                 time_range=time_range,
                 top_k=top_k,
+                rerank=True,
             )
             return {
                 "success": True,
@@ -72,8 +73,8 @@ class VectorSearchTool(BaseTool):
 class VectorLogSearchTool(BaseTool):
     """Vector search over indexed logs (separate collection)."""
 
-    def __init__(self, vector_store: VectorStore):
-        self.vs = vector_store
+    def __init__(self, hybrid_retriever: HybridRetriever):
+        self.retriever = hybrid_retriever
 
     @property
     def spec(self) -> ToolSpec:
@@ -99,12 +100,13 @@ class VectorLogSearchTool(BaseTool):
         **kwargs,
     ) -> dict[str, Any]:
         try:
-            results = self.vs.search(
+            results = self.retriever.search(
                 collection="knowledge_logs",
                 query=query,
                 filters=filters,
                 time_range=time_range,
                 top_k=top_k,
+                rerank=True,
             )
             return {
                 "success": True,
@@ -117,6 +119,6 @@ class VectorLogSearchTool(BaseTool):
             return {"success": False, "data": [], "error": str(e)}
 
 
-def register_vector_tools(vector_store: VectorStore) -> None:
-    ToolRegistry.register(VectorSearchTool(vector_store))
-    ToolRegistry.register(VectorLogSearchTool(vector_store))
+def register_vector_tools(hybrid_retriever: HybridRetriever) -> None:
+    ToolRegistry.register(VectorSearchTool(hybrid_retriever))
+    ToolRegistry.register(VectorLogSearchTool(hybrid_retriever))

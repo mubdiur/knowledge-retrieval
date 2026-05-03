@@ -17,7 +17,7 @@ class EmbeddingProcessor:
     def __init__(self, vector_store: VectorStore):
         self.vs = vector_store
 
-    def embed_and_store(
+    async def embed_and_store(
         self,
         chunks: list[dict[str, Any]],
         collection: str = "knowledge_docs",
@@ -30,8 +30,8 @@ class EmbeddingProcessor:
         texts = [c["content"] for c in chunks]
         vector_ids = [str(uuid4()) for _ in chunks]
 
-        # Batch embed
-        embeddings = self.vs.embed_batch(texts)
+        # Batch embed — offload to thread pool so we don't block the event loop
+        embeddings = await self.vs.embed_batch_async(texts)
 
         # Build points with metadata
         points = []

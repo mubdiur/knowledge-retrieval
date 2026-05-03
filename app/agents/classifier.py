@@ -27,6 +27,30 @@ CLASSIFIER_RULES = [
     (r"(why\s+were|how\s+did|what\s+caused|what\s+led\s+to).*(down|outage|failure|incident)", QueryType.HOP),
 ]
 
+# Common service-name patterns in enterprise infra
+_SERVICE_SUFFIXES = [
+    r"-api", r"-svc", r"-service", r"-gateway", r"-worker",
+    r"-db", r"-cache", r"-queue", r"-frontend", r"-backend",
+    r"_api", r"_svc", r"_service",
+]
+
+_ERROR_CODE_PATTERNS = [
+    r"\b[45]\d{2}\b",                    # HTTP status codes
+    r"\bERR_[A-Z_]+\b",                  # Error constants
+    r"\b[A-Z]+-\d{4,6}\b",               # Vendor error codes
+    r"\b0x[0-9a-fA-F]{8}\b",             # Hex error codes
+]
+
+_IP_PATTERNS = [
+    r"\b(?:\d{1,3}\.){3}\d{1,3}\b",      # IPv4
+    r"\b[0-9a-fA-F:]{4,39}\b",           # IPv6 (loose)
+]
+
+_HOSTNAME_PATTERNS = [
+    r"[\w-]+\.(?:com|org|net|io|app|local|prod|staging|dev|internal)",
+    r"[\w-]+-\d+\.[\w.-]+",              # pod-123.namespace.svc
+]
+
 
 class QueryClassifier:
     """Classifies a natural language query into a QueryType."""
@@ -53,7 +77,6 @@ class QueryClassifier:
     def needs_multi_hop(query: str) -> bool:
         """Detect if a query requires multi-hop reasoning (linking >1 entities)."""
         query_lower = query.lower()
-        # Multi-hop indicators
         indicators = [
             "why were", "how did", "what caused", "what led to",
             "correlation", "related to", "associated with",
@@ -63,38 +86,103 @@ class QueryClassifier:
 
     @staticmethod
     def extract_time_references(query: str) -> dict:
-        """Rudimentary time reference extraction."""
+        """Extract time references from query."""
         query_lower = query.lower()
         refs = {}
 
-        # Very basic ISO date detection
+        # ISO dates
         dates = re.findall(r"\d{4}-\d{2}-\d{2}", query)
         if dates:
             refs["dates"] = dates
 
         # Relative time
-        if any(w in query_lower for w in ("yesterday", "last 24h", "past day")):
+        if any(w in query_lower for w in ("yesterday", "last 24h", "past day", "24 hours")):
             refs["relative"] = "24h"
-        elif any(w in query_lower for w in ("last week", "past week", "this week")):
+        elif any(w in query_lower for w in ("last week", "past week", "this week", "7 days")):
             refs["relative"] = "7d"
-        elif any(w in query_lower for w in ("last month", "past month", "this month")):
+        elif any(w in query_lower for w in ("last month", "past month", "this month", "30 days")):
             refs["relative"] = "30d"
 
         return refs
 
     @staticmethod
-    def extract_entities(query: str) -> dict[str, str]:
-        """Naive entity extraction — services, hostnames, team names from query."""
-        entities = {}
-        # Uppercase words often signal proper names / service names
-        words = query.split()
-        proper = [w.strip("?.,!:;") for w in words if w[0].isupper() and len(w) > 1]
-        if proper:
-            entities["proper_nouns"] = proper
+    def extract_entities(query: str) -> dict[str, list[str]]:
+        """Extract entities from query using multiple pattern types.
 
-        # Hostname-like patterns
-        hosts = re.findall(r"[\w-]+\.(?:com|org|net|io|app|local|prod|staging)", query)
-        if hosts:
-            entities["hostnames"] = hosts
+        Returns:
+            dict with keys: services, hostnames, ips, error_codes, proper_nouns, teams
+        """
+        entities: dict[str, list[str]] = {
+            "services": [],
+            "hostnames": [],
+            "ips": [],
+            "error_codes": [],
+            "proper_nouns": [],
+            "teams": [],
+        }
+
+        # 1. Quoted strings (highest confidence)
+        quoted = re.findall(r'"([^"]+)"', query)
+        for q in quoted:
+            if any(s in q.lower() for s in _SERVICE_SUFFIXES) or "-" in q:
+                entities["services"].append(q)
+            else:
+                entities["proper_nouns"].append(q)
+
+        # 2. Service-name patterns (also proper nouns)
+        words = query.split()
+        for w in words:
+            w_clean = w.strip(",.;:?!")
+            if any(re.search(s + r"\b", w_clean, re.I) for s in _SERVICE_SUFFIXES):
+                if w_clean not in entities["services"]:
+                    entities["services"].append(w_clean)
+                if w_clean not in entities["proper_nouns"]:
+                    entities["proper_nouns"].append(w_clean)
+
+        # 3. Hostnames
+        for pattern in _HOSTNAME_PATTERNS:
+            matches = re.findall(pattern, query)
+            for m in matches:
+                if m not in entities["hostnames"]:
+                    entities["hostnames"].append(m)
+
+        # 4. IP addresses
+        for pattern in _IP_PATTERNS:
+            matches = re.findall(pattern, query)
+            for m in matches:
+                if m not in entities["ips"]:
+                    entities["ips"].append(m)
+
+        # 5. Error codes
+        for pattern in _ERROR_CODE_PATTERNS:
+            matches = re.findall(pattern, query)
+            for m in matches:
+                if m not in entities["error_codes"]:
+                    entities["error_codes"].append(m)
+
+        # 6. Proper nouns (uppercase words, excluding sentence-start)
+        for i, w in enumerate(words):
+            w_clean = w.strip(",.;:?!")
+            if len(w_clean) <= 1:
+                continue
+            # Skip first word if it starts the sentence (could just be capitalized)
+            if i == 0 and w_clean[0].isupper() and w_clean[1:].islower():
+                continue
+            # Skip common words
+            if w_clean.lower() in {"the", "a", "an", "this", "that", "it", "is", "are", "was", "were"}:
+                continue
+            if w_clean[0].isupper() and not any(w_clean in v for v in entities.values()):
+                entities["proper_nouns"].append(w_clean)
+
+        # 7. Team names ("team X" or "X team")
+        team_refs = re.findall(r"(?:team|squad)\s+([A-Z][\w-]+)", query, re.I)
+        team_refs += re.findall(r"([A-Z][\w-]+)\s+(?:team|squad)", query, re.I)
+        for t in team_refs:
+            if t not in entities["teams"]:
+                entities["teams"].append(t)
+
+        # Deduplicate within each list
+        for key in entities:
+            entities[key] = list(dict.fromkeys(entities[key]))
 
         return entities

@@ -69,6 +69,14 @@ class VectorStore:
         embeddings = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
         return [e.tolist() for e in embeddings]
 
+    async def embed_async(self, text: str) -> list[float]:
+        import asyncio
+        return await asyncio.to_thread(self.embed, text)
+
+    async def embed_batch_async(self, texts: list[str]) -> list[list[float]]:
+        import asyncio
+        return await asyncio.to_thread(self.embed_batch, texts)
+
     def upsert(
         self,
         collection: str,
@@ -134,21 +142,40 @@ class VectorStore:
 
         filter_obj = qm.Filter(must=must_conditions) if must_conditions else None
 
-        hits = self.client.search(
-            collection_name=collection,
-            query_vector=vector,
-            query_filter=filter_obj,
-            limit=top_k,
-            score_threshold=score_threshold,
-        )
+        # qdrant-client >= 1.17 uses query_points instead of search
+        try:
+            response = self.client.query_points(
+                collection_name=collection,
+                query=vector,
+                query_filter=filter_obj,
+                limit=top_k,
+                score_threshold=score_threshold,
+            )
+            # New API returns QueryResponse with .points
+            hits = response.points
+        except TypeError:
+            # Fallback for older qdrant-client versions
+            hits = self.client.search(
+                collection_name=collection,
+                query_vector=vector,
+                query_filter=filter_obj,
+                limit=top_k,
+                score_threshold=score_threshold,
+            )
 
         results = []
         for hit in hits:
+            payload_source = hit.payload.get("source", "")
+            # Tag results with the retrieval source type for downstream filtering
+            retrieval_source = "vector_store"
+            if "log" in collection:
+                retrieval_source = "vector_store_logs"
             results.append({
-                "id": hit.id,
+                "id": str(hit.id),
                 "score": hit.score,
                 "content": hit.payload.get("content", ""),
-                "source": hit.payload.get("source", ""),
+                "source": payload_source,
+                "retrieval_source": retrieval_source,
                 "metadata": hit.payload.get("metadata", {}),
             })
         return results

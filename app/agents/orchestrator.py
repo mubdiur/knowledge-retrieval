@@ -7,6 +7,7 @@ from typing import Any
 
 from app.agents.classifier import QueryClassifier
 from app.agents.reasoning import ReasoningEngine
+from app.agents.conversation import ConversationStore
 from app.tools.base import ToolRegistry
 from app.models.schemas import QueryResponse, SourceRef
 
@@ -16,9 +17,10 @@ logger = logging.getLogger(__name__)
 class AgentOrchestrator:
     """Top-level orchestrator that runs the full agent pipeline."""
 
-    def __init__(self):
+    def __init__(self, llm_client=None):
         self.classifier = QueryClassifier()
-        self.reasoning = ReasoningEngine()
+        self.reasoning = ReasoningEngine(llm_client=llm_client)
+        self.conversations = ConversationStore()
 
     async def answer(
         self,
@@ -27,27 +29,46 @@ class AgentOrchestrator:
         time_range: tuple | None = None,
         top_k: int = 10,
         enable_refinement: bool = True,
+        conversation_id: str | None = None,
     ) -> QueryResponse:
-        """Process a query end-to-end and return a structured response."""
+        """Process a query end-to-end and return a structured response.
+
+        If conversation_id is provided, prior context is used to enrich
+        the query (follow-up pronouns, implicit entities, etc.).
+        """
         start_time = time.monotonic()
 
-        # 1. Classify
-        query_type = self.classifier.classify(query)
-        needs_multi = self.classifier.needs_multi_hop(query)
+        # ── Conversation context ─────────────────────────────────────────
+        conv_id = conversation_id or self.conversations.create()
+        context_summary = ""
+        if conversation_id:
+            context_summary = self.conversations.summarize_context(conv_id)
+            # Inject context into query for implicit references
+            if context_summary:
+                enriched_query = f"{query} [Context: {context_summary}]"
+                logger.debug("Enriched query with context: %s", enriched_query[:200])
+            else:
+                enriched_query = query
+        else:
+            enriched_query = query
+
+        # ── Classify ─────────────────────────────────────────────────────
+        query_type = self.classifier.classify(enriched_query)
+        needs_multi = self.classifier.needs_multi_hop(enriched_query)
         logger.info("Query classified: type=%s multi_hop=%s", query_type, needs_multi)
 
         # Override type if multi-hop detected
         if needs_multi and query_type not in ("causal", "time_based"):
             query_type = "multi_hop"
 
-        # 2. Time range from query if not provided
+        # ── Time range from query if not provided ────────────────────────
         if time_range is None:
-            time_refs = self.classifier.extract_time_references(query)
+            time_refs = self.classifier.extract_time_references(enriched_query)
             time_range = self._resolve_time_range(time_refs)
 
-        # 3. Run reasoning
+        # ── Run reasoning ────────────────────────────────────────────────
         answer_text, reasoning_steps = await self.reasoning.reason(
-            query=query,
+            query=enriched_query,
             query_type=query_type,
             filters=filters,
             time_range=time_range,
@@ -55,7 +76,11 @@ class AgentOrchestrator:
             enable_refinement=enable_refinement,
         )
 
-        # 4. Collect sources from reasoning steps
+        # ── Store conversation turns ─────────────────────────────────────
+        self.conversations.add_turn(conv_id, "user", query, query_type)
+        self.conversations.add_turn(conv_id, "assistant", answer_text, query_type)
+
+        # ── Collect sources ──────────────────────────────────────────────
         sources = self._extract_sources(reasoning_steps, answer_text)
 
         elapsed = (time.monotonic() - start_time) * 1000

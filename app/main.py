@@ -22,6 +22,7 @@ from app.tools import (
 )
 from app.agents.orchestrator import AgentOrchestrator
 from app.api.routes import router, init_routes
+from app.llm.client import OllamaClient
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -75,15 +76,23 @@ async def lifespan(app: FastAPI):
         logger.warning("Reranker not available (non-fatal): %s", e)
 
     # ── Register Tools ────────────────────────────────────────────────────
-    register_vector_tools(vector_store)
-    register_keyword_tool(bm25)
+    register_vector_tools(hybrid)
+    register_keyword_tool(hybrid)
     register_sql_tool(session_factory)
     register_incident_tool(session_factory)
     register_entity_tool(session_factory)
     logger.info("Tools registered:\n%s", ToolRegistry.describe())
 
+    # ── LLM Client ────────────────────────────────────────────────────────
+    llm_client = OllamaClient()
+    llm_available = await llm_client.is_available()
+    if llm_available:
+        logger.info("LLM client ready (model: %s)", llm_client.model)
+    else:
+        logger.warning("LLM not available — falling back to rule-based refinement and synthesis")
+
     # ── Agent ─────────────────────────────────────────────────────────────
-    orchestrator = AgentOrchestrator()
+    orchestrator = AgentOrchestrator(llm_client=llm_client if llm_available else None)
     init_routes(orchestrator)
 
     # Store references in app state for other components

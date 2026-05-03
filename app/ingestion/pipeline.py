@@ -42,6 +42,7 @@ class IngestionPipeline:
         )
         self.extractor = EntityExtractor()
         self.embedder = EmbeddingProcessor(vector_store)
+        self._bm25_lock = asyncio.Lock()
 
     async def ingest_file(self, file_path: str | Path) -> dict[str, Any]:
         """Ingest a single file through the full pipeline."""
@@ -87,8 +88,8 @@ class IngestionPipeline:
             enriched_chunks, vector_ids,
         )
 
-        # 8. Rebuild BM25 index with new chunks
-        await self._rebuild_bm25()
+        # 8. Incrementally add new chunks to BM25 index
+        await self._add_to_bm25(enriched_chunks, vector_ids)
 
         return {
             "filename": file_path.name,
@@ -158,24 +159,21 @@ class IngestionPipeline:
             logger.info("  → DB record: document_id=%d, chunks=%d", doc.id, len(db_chunks))
             return doc.id
 
-    async def _rebuild_bm25(self) -> None:
-        """Rebuild BM25 index from all chunks in the database."""
-        try:
-            async with self.session_factory() as session:
-                from sqlalchemy import select
-                result = await session.execute(
-                    select(Chunk).limit(5000)
-                )
-                rows = result.scalars().all()
-                docs = [
-                    {"id": c.vector_id, "content": c.content, "metadata": c.metadata_json}
-                    for c in rows
-                ]
-                if docs:
-                    self.bm25.index(docs)
-                    logger.info("BM25 index rebuilt: %d docs", len(docs))
-        except Exception as e:
-            logger.warning("BM25 rebuild skipped: %s", e)
+    async def _add_to_bm25(
+        self,
+        chunks: list[dict],
+        vector_ids: list[str],
+    ) -> None:
+        """Incrementally add new chunks to the BM25 index."""
+        docs = [
+            {"id": vid, "content": c["content"], "metadata": c.get("metadata", {})}
+            for c, vid in zip(chunks, vector_ids)
+        ]
+        if not docs:
+            return
+        async with self._bm25_lock:
+            self.bm25.add_documents(docs)
+            logger.info("BM25 index incrementally updated: +%d docs", len(docs))
 
     async def reset_all(self) -> None:
         """Reset all data — collections, tables, indexes."""

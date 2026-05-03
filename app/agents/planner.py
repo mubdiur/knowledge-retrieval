@@ -12,12 +12,18 @@ The loop stops when confidence is high or max iterations reached.
 """
 
 import logging
+import math
 import re
 from typing import Any, Callable
 
 from app.tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# Lazy import to avoid loading LLM client unless needed
+def _get_llm_client():
+    from app.llm.client import OllamaClient
+    return OllamaClient()
 
 
 # ── Data Classes ──────────────────────────────────────────────────────────────
@@ -135,12 +141,17 @@ class QueryPlanner:
         - Early stopping prevents wasted tool calls when we have enough
     """
 
-    def __init__(self):
+    def __init__(self, llm_client=None):
         self._plan_hooks: list[Callable] = []
+        self._llm = llm_client
 
     def register_planner_hook(self, hook: Callable) -> None:
         """Register an external planner (e.g. LLM-based) that can override planning."""
         self._plan_hooks.append(hook)
+
+    def set_llm_client(self, llm_client) -> None:
+        """Attach an LLM client for intelligent refinement."""
+        self._llm = llm_client
 
     # ── Iterative Loop ───────────────────────────────────────────────────────
 
@@ -219,7 +230,7 @@ class QueryPlanner:
                 and step_counter < max_iterations
             ):
                 step_counter += 1
-                refine_step = self._generate_refinement(
+                refine_step = await self._generate_refinement(
                     step_counter, observation, entities_found, query,
                 )
                 if refine_step is None:
@@ -381,34 +392,30 @@ class QueryPlanner:
 
         Factors:
             - Has data at all
-            - Number of results (more = higher confidence, up to a point)
-            - Source reliability (SQL > vector > keyword > entity lookup)
+            - Result quality (log-saturating: 1 result = 0.5, 3 = 0.7, 10 = 0.85)
+            - Source reliability (SQL structured > incidents > vector > BM25 > entity)
         """
         if not result.get("success"):
             return 0.0
 
         if count == 0:
-            return 0.1  # Empty but successful
+            return 0.05  # Empty but successful
 
-        # Base from count (saturating at 10)
-        count_score = min(count / 10.0, 1.0)
+        # Quality score: log-saturating so 3 great results > 10 weak ones
+        count_score = min(math.log1p(count) / math.log1p(10), 0.85)
 
-        # Source reliability multiplier
+        # Source reliability tier (smaller, additive)
         source = result.get("source", "")
-        if source == "postgresql":
-            source_bonus = 0.2
-        elif source in ("incidents_db",):
-            source_bonus = 0.15
-        elif source in ("vector_store", "vector_store_logs"):
-            source_bonus = 0.1
-        elif source == "bm25":
-            source_bonus = 0.05
-        elif source == "entity_db":
-            source_bonus = 0.0  # Entity lookup is supporting data
-        else:
-            source_bonus = 0.0
+        source_bonus = {
+            "postgresql": 0.10,
+            "incidents_db": 0.08,
+            "vector_store": 0.06,
+            "vector_store_logs": 0.06,
+            "bm25": 0.04,
+            "entity_db": 0.02,
+        }.get(source, 0.0)
 
-        return min(count_score + source_bonus, 1.0)
+        return round(min(count_score + source_bonus, 1.0), 3)
 
     def _detect_gap(
         self,
@@ -474,7 +481,89 @@ class QueryPlanner:
 
     # ── Refinement Generation ─────────────────────────────────────────────
 
-    def _generate_refinement(
+    async def _generate_refinement_llm(
+        self,
+        step_id: int,
+        observation: Observation,
+        entities_found: list[str],
+        original_query: str,
+    ) -> ExecutionStep | None:
+        """Use LLM to intelligently decide the next refinement step."""
+        if self._llm is None:
+            return None
+
+        gap = observation.gap or "No gap detected"
+        tools_available = [
+            "search_vector — semantic search over documents/logs",
+            "search_keyword — exact BM25 keyword search",
+            "entity_lookup — find people, services, teams, hosts by name",
+            "query_sql — execute SELECT queries on structured data",
+            "get_incidents — query incidents by time, severity, service, team",
+        ]
+
+        prompt = f"""You are a query planner for an incident knowledge system.
+
+Original query: {original_query}
+Gap detected: {gap}
+Entities found so far: {entities_found[-5:] if entities_found else 'none'}
+Last tool used: {observation.tool}
+Results count: {observation.result_count}
+
+Available tools:
+{chr(10).join(tools_available)}
+
+Respond with EXACTLY one line in this format:
+TOOL: <tool_name> | QUERY: <search query or entity name> | RATIONALE: <brief reason>
+
+Choose the tool and query that best addresses the gap. Be specific."""
+
+        response = await self._llm.generate(prompt, max_tokens=60, temperature=0.2)
+        if not response:
+            return None
+
+        # Parse the response
+        try:
+            # Extract tool, query, rationale from the response line
+            tool_match = re.search(r"TOOL:\s*(\w+)", response, re.I)
+            query_match = re.search(r"QUERY:\s*([^|]+)", response, re.I)
+            rationale_match = re.search(r"RATIONALE:\s*(.+)", response, re.I)
+
+            tool_name = tool_match.group(1).strip().lower() if tool_match else "search_vector"
+            query_str = query_match.group(1).strip() if query_match else original_query
+            rationale = rationale_match.group(1).strip() if rationale_match else f"LLM refinement for: {gap}"
+
+            # Map tool names
+            tool_map = {
+                "search_vector": "search_vector",
+                "search_keyword": "search_keyword",
+                "entity_lookup": "entity_lookup",
+                "query_sql": "query_sql",
+                "get_incidents": "get_incidents",
+            }
+            tool_name = tool_map.get(tool_name, "search_vector")
+
+            # Build params based on tool
+            params = {"query": query_str}
+            if tool_name in ("search_vector", "search_keyword"):
+                params["top_k"] = 10
+            elif tool_name == "entity_lookup":
+                params = {"name": query_str}
+            elif tool_name == "get_incidents":
+                params = {"limit": 10}
+
+            return ExecutionStep(
+                step_id=step_id,
+                tool=tool_name,
+                description=f"LLM refinement: {query_str[:60]}",
+                rationale=rationale[:200],
+                params=params,
+                result_key=f"refine_{step_id}",
+            )
+        except Exception as e:
+            logger.warning("LLM refinement parse failed: %s", e)
+            return None
+
+    async def _generate_refinement(
         self,
         step_id: int,
         observation: Observation,
@@ -483,14 +572,18 @@ class QueryPlanner:
     ) -> ExecutionStep | None:
         """Dynamically generate a refinement step based on observation.
 
-        This is where the iterative loop gets its power:
-        - If we found entities but no docs about them → search_vector
-        - If we found incidents but no root cause → search_keyword for terms
-        - If we found docs but no owner → entity_lookup
+        Tries LLM first for intelligent refinement, falls back to rule-based.
         """
         gap = observation.gap
         if gap is None:
             return None
+
+        # Try LLM-driven refinement first
+        if self._llm is not None:
+            llm_step = await self._generate_refinement_llm(step_id, observation, entities_found, original_query)
+            if llm_step is not None:
+                logger.info("Using LLM-driven refinement: %s", llm_step.tool)
+                return llm_step
 
         # Gap: incidents without root cause → search for related docs
         if "root cause" in (gap or "").lower():
@@ -525,15 +618,50 @@ class QueryPlanner:
                 result_key=f"refine_{step_id}",
             )
 
-        # Gap: need owner → entity lookup
+        # Gap: need owner → SQL query for ownership info
         if "owner" in (gap or "").lower():
             name = self._extract_entity_name(original_query)
+            # Build a SQL query to find the owner
+            def build_owner_sql(ent_name):
+                def _build(prior):
+                    # Check if entity_lookup already ran and found the entity
+                    for k, v in prior.items():
+                        if isinstance(k, int):
+                            data = v.get("data", {})
+                            if isinstance(data, dict):
+                                services = data.get("services", [])
+                                if services:
+                                    svc = services[0].get("name", ent_name)
+                                    return {
+                                        "query": """
+                                            SELECT s.name, u.name as owner_name, u.email as owner_email,
+                                                   t.name as team_name
+                                            FROM services s
+                                            LEFT JOIN users u ON s.owner_id = u.id
+                                            LEFT JOIN teams t ON s.team_id = t.id
+                                            WHERE s.name ILIKE :pattern
+                                            LIMIT 5
+                                        """,
+                                        "params": {"pattern": f"%{svc}%"},
+                                    }
+                    # Fallback: use extracted name
+                    return {
+                        "query": """
+                            SELECT s.name, u.name as owner_name, u.email as owner_email, t.name as team_name
+                            FROM services s
+                            LEFT JOIN users u ON s.owner_id = u.id
+                            LEFT JOIN teams t ON s.team_id = t.id
+                            WHERE s.name ILIKE :pattern
+                            LIMIT 5
+                        """,
+                        "params": {"pattern": f"%{ent_name}%"},
+                    }
+                return _build
             return ExecutionStep(
-                step_id=step_id,
-                tool="entity_lookup",
+                step_id=step_id, tool="query_sql",
                 description=f"Find owner for: {name}",
-                rationale=f"Query asks about ownership. Looking up '{name}' to find responsible team/person",
-                params={"name": name},
+                rationale=f"Entity found but missing owner details. Querying database for ownership relationships.",
+                params_builder=build_owner_sql(name),
                 result_key=f"refine_{step_id}",
             )
 
@@ -550,7 +678,11 @@ class QueryPlanner:
     # ── Final Confidence Assessment ───────────────────────────────────────
 
     def _assess_confidence(self, results: dict[int, Any]) -> float:
-        """Overall confidence across all executed steps (0.0-1.0)."""
+        """Overall confidence across all executed steps (0.0-1.0).
+
+        Uses the maximum step confidence weighted by source reliability,
+        not an average of raw counts.
+        """
         if not results:
             return 0.0
 
@@ -558,13 +690,17 @@ class QueryPlanner:
         for step_id, result in results.items():
             if isinstance(step_id, int) and result.get("success"):
                 count = result.get("result_count", len(result.get("data", [])))
-                score = min(count / 5.0, 1.0) if count > 0 else 0.1
+                score = self._score_confidence(
+                    ExecutionStep(step_id, result.get("source", "unknown"), ""),
+                    result, count,
+                )
                 scores.append(score)
 
         if not scores:
             return 0.0
 
-        return sum(scores) / len(scores)
+        # Use max confidence, not average — one strong result is enough
+        return round(max(scores), 3)
 
     # ── Plan Generation ──────────────────────────────────────────────────────
 
@@ -591,6 +727,9 @@ class QueryPlanner:
                 logger.warning("External planner hook failed: %s", e)
 
         plan_fn = getattr(self, f"_plan_{query_type}", self._plan_exploratory)
+        # If plan_fn is still the fallback, try extracting enum value
+        if plan_fn == self._plan_exploratory and hasattr(query_type, "value"):
+            plan_fn = getattr(self, f"_plan_{query_type.value}", self._plan_exploratory)
         return plan_fn(query, filters, time_range)
 
     # ── Built-in Plans ───────────────────────────────────────────────────────
@@ -626,24 +765,32 @@ class QueryPlanner:
             services = entity.get("services", [])
             if services:
                 svc_name = services[0].get("name", "")
-                return {"query": f"""
-                    SELECT s.name, s.environment, u.name as owner, t.name as team
-                    FROM services s
-                    LEFT JOIN users u ON s.owner_id = u.id
-                    LEFT JOIN teams t ON s.team_id = t.id
-                    WHERE s.name ILIKE '%{svc_name}%'
-                """}
+                return {
+                    "query": """
+                        SELECT s.name, s.environment, u.name as owner, t.name as team
+                        FROM services s
+                        LEFT JOIN users u ON s.owner_id = u.id
+                        LEFT JOIN teams t ON s.team_id = t.id
+                        WHERE s.name ILIKE :pattern
+                        LIMIT 20
+                    """,
+                    "params": {"pattern": f"%{svc_name}%"},
+                }
             teams = entity.get("teams", [])
             if teams:
                 team_name = teams[0].get("name", "")
-                return {"query": f"""
-                    SELECT s.name, s.environment, u.name as owner
-                    FROM services s
-                    JOIN teams t ON s.team_id = t.id
-                    JOIN users u ON s.owner_id = u.id
-                    WHERE t.name ILIKE '%{team_name}%'
-                """}
-            return {"query": "SELECT name, environment FROM services LIMIT 10"}
+                return {
+                    "query": """
+                        SELECT s.name, s.environment, u.name as owner
+                        FROM services s
+                        JOIN teams t ON s.team_id = t.id
+                        JOIN users u ON s.owner_id = u.id
+                        WHERE t.name ILIKE :pattern
+                        LIMIT 20
+                    """,
+                    "params": {"pattern": f"%{team_name}%"},
+                }
+            return {"query": "SELECT name, environment FROM services LIMIT 10", "params": {}}
 
         steps.append(
             ExecutionStep(
@@ -869,27 +1016,46 @@ class QueryPlanner:
     def _extract_entity_name(query: str) -> str:
         """Extract entity name from a query string."""
         q = query.strip().rstrip("?.")
+        # Strip question/query prefixes — they're not entity names
         for prefix in [
             "who owns ", "who is ", "what is ", "find ", "about ",
             "what services does ", "what hosts does ", "what incidents ",
-            "tell me about ",
+            "tell me about ", "show me ",
+            "what caused the ", "what caused ", "why did ", "why was ",
+            "how did ", "how was ",
         ]:
             if q.lower().startswith(prefix):
                 q = q[len(prefix):]
 
-        for stop in ["the ", "a ", "an "]:
+        for stop in ["the ", "a ", "an ", "this ", "that "]:
             if q.lower().startswith(stop):
                 q = q[len(stop):]
 
+        # If there's a quoted term, use it
         quoted = re.findall(r'"([^"]+)"', q)
         if quoted:
             return quoted[0]
 
         words = q.split()
+        # Skip interrogative words at the start
+        interrogatives = {"what", "who", "why", "how", "when", "where", "which", "did", "does", "is", "are", "was", "were"}
+        while words and words[0].lower().strip("?.,!:;") in interrogatives:
+            words = words[1:]
+
+        if not words:
+            return ""
+
+        # Try uppercase words first (proper names)
         proper = [w for w in words if w[0].isupper()]
         if proper:
             return " ".join(proper[:3])
 
+        # Look for hyphenated compound names (common in service names)
+        compounds = [w.strip("?.,!:;") for w in words if "-" in w and len(w) > 3]
+        if compounds:
+            return compounds[0]
+
+        # Fallback: words adjacent to entity-indicating keywords
         entity_kw = {"team", "service", "host", "user", "incident", "system",
                       "gateway", "database", "server", "cluster", "api"}
         for i, w in enumerate(words):
@@ -898,14 +1064,13 @@ class QueryPlanner:
                 if i > 0:
                     candidate = words[i - 1].strip(",;:")
                     if len(candidate) > 2 and candidate.lower() not in {"the","a","an","this","that","our","your"}:
-                        return candidate
+                        if "-" in candidate:
+                            return candidate
+                        return f"{candidate}-{stripped}"  # reconstruct compound name
                 if i + 1 < len(words):
                     return words[i + 1].strip(",;:")
 
-        compounds = [w.strip("?.,!:;") for w in words if "-" in w and len(w) > 3]
-        if compounds:
-            return compounds[0]
-
+        # Last resort: first 2 meaningful alpha words
         meaningful = [w for w in words if len(w) > 2 and w.isalpha()]
         if meaningful:
             return " ".join(meaningful[:2])

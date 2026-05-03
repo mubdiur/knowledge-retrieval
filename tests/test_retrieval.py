@@ -8,12 +8,12 @@ from app.retrieval.reranker import merge_and_dedup
 
 class TestBM25Index:
     def test_empty_index(self):
-        bm25 = BM25Index()
+        bm25 = BM25Index(index_path="/tmp/bm25_test_empty.json")
         assert bm25.search("test") == []
         assert bm25.is_ready is False
 
     def test_index_and_search(self):
-        bm25 = BM25Index()
+        bm25 = BM25Index(index_path="/tmp/bm25_test_index.json")
         docs = [
             {"id": "1", "content": "Payment gateway database connection pool exhaustion"},
             {"id": "2", "content": "Redis cluster failover caused high latency"},
@@ -26,7 +26,7 @@ class TestBM25Index:
         assert bm25.doc_count == 5
 
     def test_relevant_results(self):
-        bm25 = BM25Index()
+        bm25 = BM25Index(index_path="/tmp/bm25_test_relevant.json")
         docs = [
             {"id": "1", "content": "Payment gateway database connection pool exhaustion"},
             {"id": "2", "content": "Redis cluster failover caused high latency"},
@@ -38,7 +38,7 @@ class TestBM25Index:
         assert results[0]["id"] == "1"
 
     def test_no_match(self):
-        bm25 = BM25Index()
+        bm25 = BM25Index(index_path="/tmp/bm25_test_nomatch.json")
         docs = [{"id": "1", "content": "Payment processing and fraud detection"}]
         bm25.index(docs)
         results = bm25.search("kubernetes deployment strategy")
